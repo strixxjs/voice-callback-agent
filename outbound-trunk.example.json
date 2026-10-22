@@ -1,10 +1,11 @@
 {
-  "name": "outbound-trunk-example",
-  "address": "sip.telnyx.com",
-  "transport": "SIP_TRANSPORT_AUTO",
-  "numbers": [
-    "+48XXXXXXXXX"
-  ],
-  "auth_username": "YOUR_SIP_USERNAME",
-  "auth_password": "YOUR_SIP_PASSWORD"
+  "trunk": {
+    "name": "outbound-trunk-example",
+    "address": "sip.telnyx.com",
+    "numbers": [
+      "+1XXXXXXXXXX"
+    ],
+    "auth_username": "YOUR_SIP_USERNAME",
+    "auth_password": "YOUR_SIP_PASSWORD"
+  }
 }
