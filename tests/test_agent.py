@@ -280,6 +280,7 @@ def test_get_llm_fallback_adapter_wrapping(monkeypatch: pytest.MonkeyPatch) -> N
     """Verifies get_llm wraps with FallbackAdapter when fallback model is set."""
     from livekit.agents.llm import FallbackAdapter
 
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
     monkeypatch.setattr(settings, "llm_provider", "google")
     monkeypatch.setattr(settings, "llm_model", "gemini-3.5-flash-lite")
     monkeypatch.setattr(settings, "llm_fallback_model", "gemini-3.5-flash")
