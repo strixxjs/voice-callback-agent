@@ -1,0 +1,29 @@
+# Conversation script configuration — editable without code changes
+# Supported languages: "uk" (default demo), "pl", "en"
+company_name: "Solaris Tech"
+agent_name: "Анна"
+language: "uk"
+
+# Greeting: AI assistant intro + call recording disclosure
+greeting: "Доброго дня! Мене звати Анна, я віртуальна асистентка компанії Solaris Tech. Попереджаю, що розмова може записуватися. Телефоную у відповідь на заявку, яку ви залишили на нашому сайті. Чи підкажете, як я можу до вас звертатися?"
+
+# Closing phrase spoken when the call wraps up
+closing_phrase: "Щиро дякую за розмову! Я передала всю інформацію нашому консультанту, він зв'яжеться з вами у найзручніший час. Бажаю гарного дня та до зв'язку!"
+
+# Fixed error phrase spoken if LLM fails after all retries and fallbacks
+error_phrase: "Перепрошую, у нас виникла технічна помилка. Наш менеджер обов'язково зателефонує вам найближчим часом. До побачення!"
+
+# Questions to ask in order
+questions:
+  - field: "name"
+    question: "Чи можу я уточнити ваше ім'я та прізвище?"
+    required: true
+  - field: "service"
+    question: "Яка саме послуга чи рішення вас найбільше цікавить?"
+    required: true
+  - field: "timeline"
+    question: "На коли ви плануєте реалізацію або впровадження проекту?"
+    required: false
+  - field: "preferred_call_time"
+    question: "О котрій годині нашому менеджеру буде найзручніше вам зателефонувати?"
+    required: true

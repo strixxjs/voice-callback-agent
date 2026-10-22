@@ -30,15 +30,31 @@ class Settings(BaseSettings):
     livekit_api_key: str | None = None
     livekit_api_secret: str | None = None
     livekit_sip_outbound_trunk_id: str | None = None
-    agent_name: str = "callback-agent"
+    # Empty for automatic dispatch (Playground/dev), set name for explicit dispatch
+    agent_dispatch_name: str = ""
 
-    # Models
+    # Models & Voice Pipeline
+    llm_provider: str = "google"
+    llm_model: str = "gemini-3.5-flash-lite"
+    llm_fallback_model: str | None = "gemini-3.5-flash"
+    google_api_key: str | None = None
     openai_api_key: str | None = None
-    llm_model: str | None = None
+
+    stt_provider: str = "deepgram"
+    stt_model: str | None = None
+    # Optional STT language override; if None, language from script.yaml is used
+    stt_language: str | None = None
     deepgram_api_key: str | None = None
-    stt_language: str = "pl"
-    elevenlabs_api_key: str | None = None
+
+    tts_provider: str = "elevenlabs"
+    tts_model: str | None = None
     tts_voice_id: str | None = None
+    elevenlabs_api_key: str | None = None
+
+    # Turn detection: "vad" (local Silero, free) or "turn_detector" (cloud inference)
+    turn_detection_mode: str = "vad"
+    # Interruption mode: "vad" (local Silero, free) or "adaptive" (cloud inference)
+    interruption_mode: str = "vad"
 
     # Delivery
     telegram_bot_token: str | None = None
