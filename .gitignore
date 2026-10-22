@@ -39,6 +39,7 @@ htmlcov/
 # Environment variables & secrets
 .env
 *.env.local
+outbound-trunk.json
 
 # IDE & editors
 .vscode/

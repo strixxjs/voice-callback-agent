@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     livekit_url: str = "wss://your-project.livekit.cloud"
     livekit_api_key: str | None = None
     livekit_api_secret: str | None = None
-    livekit_sip_outbound_trunk_id: str | None = None
+    sip_outbound_trunk_id: str | None = None
     # Empty for automatic dispatch (Playground/dev), set name for explicit dispatch
     agent_dispatch_name: str = ""
 

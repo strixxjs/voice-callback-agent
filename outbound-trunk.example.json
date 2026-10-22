@@ -1,0 +1,11 @@
+{
+  "trunk": {
+    "name": "outbound-trunk-example",
+    "address": "sip.telnyx.com",
+    "numbers": [
+      "+1XXXXXXXXXX"
+    ],
+    "auth_username": "YOUR_SIP_USERNAME",
+    "auth_password": "YOUR_SIP_PASSWORD"
+  }
+}
