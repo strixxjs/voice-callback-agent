@@ -17,4 +17,10 @@ def isolate_env(monkeypatch: pytest.MonkeyPatch) -> Settings:
     monkeypatch.setattr(app.config, "settings", clean_settings)
     monkeypatch.setattr(agent.worker, "settings", clean_settings)
     monkeypatch.setattr(tests.test_agent, "settings", clean_settings)
+    try:
+        import scripts.call_me
+
+        monkeypatch.setattr(scripts.call_me, "settings", clean_settings)
+    except ImportError:
+        pass
     return clean_settings
