@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import uuid
 from typing import Any
 
+from google.protobuf.duration_pb2 import Duration
+from livekit import api
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -22,8 +26,14 @@ from livekit.agents import (
     llm,
 )
 from livekit.agents.voice.agent_session import SessionConnectOptions
+from livekit.agents.voice.room_io import RoomOptions
 
 from agent.prompts import ScriptConfig, build_system_prompt, load_script
+from agent.telephony import (
+    extract_job_phone_number,
+    mask_phone_number,
+    validate_e164,
+)
 from agent.tools import SessionState, end_call, save_answer, terminate_call
 from app.config import settings
 
@@ -250,6 +260,19 @@ def log_session_summary(
     return summary
 
 
+async def _cleanup_and_shutdown(
+    ctx: JobContext,
+    reason: str,
+    session: AgentSession | None = None,
+) -> None:
+    """Closes session (if open), deletes room, and shuts down job context."""
+    if session is not None:
+        await session.aclose()
+    with contextlib.suppress(Exception):
+        await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
+    ctx.shutdown(reason=reason)
+
+
 server = AgentServer(
     ws_url=settings.livekit_url,
     api_key=settings.livekit_api_key,
@@ -261,12 +284,41 @@ server = AgentServer(
 @server.rtc_session(agent_name=settings.agent_dispatch_name)
 async def entrypoint(ctx: JobContext) -> None:
     """RTC session entrypoint for voice callback agent."""
-    logger.info("Initializing voice agent session for room: %s", ctx.room.name)
+    has_phone_key, raw_phone = extract_job_phone_number(
+        getattr(ctx.job, "metadata", None)
+    )
+
+    if has_phone_key:
+        if not raw_phone or not validate_e164(raw_phone):
+            logger.error(
+                "Invalid E.164 phone number in job metadata: '%s'. Aborting call.",
+                mask_phone_number(raw_phone or ""),
+            )
+            await _cleanup_and_shutdown(ctx, reason="invalid phone_number in metadata")
+            return
+
+        phone_number = raw_phone
+        phone_mode = True
+        logger.info(
+            "Initializing voice agent session for room: %s (phone mode, callee: %s)",
+            ctx.room.name,
+            mask_phone_number(phone_number),
+        )
+    else:
+        phone_number = None
+        phone_mode = False
+        logger.info(
+            "Initializing voice agent session for room: %s (browser mode)",
+            ctx.room.name,
+        )
 
     script = load_script()
     session_state = SessionState(
         closing_phrase=script.closing_phrase,
         error_phrase=script.error_phrase,
+        phone_mode=phone_mode,
+        room_name=ctx.room.name,
+        api=ctx.api,
     )
 
     # script.yaml is the single source of truth for language;
@@ -334,22 +386,93 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(on_session_done)
 
-    # Connect to room and wait for participant
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-    logger.info("Connected to room '%s', waiting for participant...", ctx.room.name)
-    participant = await ctx.wait_for_participant()
-    logger.info(
-        "Participant joined: identity=%s, name=%s",
-        participant.identity,
-        participant.name,
-    )
+    if phone_mode and phone_number is not None:
+        trunk_id = settings.sip_outbound_trunk_id
+        if not trunk_id:
+            logger.error(
+                "SIP_OUTBOUND_TRUNK_ID is not configured in settings. "
+                "Cannot place phone call."
+            )
+            await _cleanup_and_shutdown(ctx, reason="missing SIP_OUTBOUND_TRUNK_ID")
+            return
 
-    await session.start(agent=agent, room=ctx.room)
+        # Connect to room first
+        await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+        logger.info("Connected to room '%s' in phone mode.", ctx.room.name)
 
-    # Agent speaks first with the greeting.
-    # Note: Interruptions are disabled as it contains the call recording notice.
-    logger.info("Agent greeting participant with: '%s'", script.greeting)
-    await session.say(script.greeting, allow_interruptions=False)
+        opaque_identity = f"sip_{uuid.uuid4().hex[:8]}"
+        room_options = RoomOptions(
+            participant_identity=opaque_identity,
+            delete_room_on_close=True,
+        )
+
+        # Start the session so no audio is lost once answered
+        await session.start(agent=agent, room=ctx.room, room_options=room_options)
+
+        # Dial out via SIP
+        logger.info(
+            "Dialing %s via trunk %s...",
+            mask_phone_number(phone_number),
+            trunk_id,
+        )
+        try:
+            sip_req = api.CreateSIPParticipantRequest(
+                room_name=ctx.room.name,
+                sip_trunk_id=trunk_id,
+                sip_call_to=phone_number,
+                participant_identity=opaque_identity,
+                wait_until_answered=True,
+                ringing_timeout=Duration(seconds=30),
+                max_call_duration=Duration(seconds=600),
+            )
+            sip_info = await ctx.api.sip.create_sip_participant(sip_req)
+            logger.info(
+                "Call answered by %s (participant identity: %s)",
+                mask_phone_number(phone_number),
+                sip_info.participant_identity or opaque_identity,
+            )
+        except api.SipCallError as e:
+            logger.error(
+                "SIP call to %s failed: status_code=%s, status=%s, reason=%s",
+                mask_phone_number(phone_number),
+                e.sip_status_code,
+                e.sip_status,
+                e.message,
+            )
+            await _cleanup_and_shutdown(
+                ctx,
+                reason=f"sip call failed: {e.sip_status or e.message}",
+                session=session,
+            )
+            return
+        except Exception as e:
+            logger.error(
+                "Dialing %s failed: %s",
+                mask_phone_number(phone_number),
+                e,
+            )
+            await _cleanup_and_shutdown(ctx, reason="dial failed", session=session)
+            return
+
+        # Greet only after the call is answered
+        logger.info("Agent greeting participant with: '%s'", script.greeting)
+        await session.say(script.greeting, allow_interruptions=False)
+
+    else:
+        # Browser mode (M1 behaviour)
+        await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+        logger.info("Connected to room '%s', waiting for participant...", ctx.room.name)
+        participant = await ctx.wait_for_participant()
+        logger.info(
+            "Participant joined: identity=%s, name=%s",
+            participant.identity,
+            participant.name,
+        )
+
+        await session.start(agent=agent, room=ctx.room)
+
+        logger.info("Agent greeting participant with: '%s'", script.greeting)
+        await session.say(script.greeting, allow_interruptions=False)
 
 
 if __name__ == "__main__":

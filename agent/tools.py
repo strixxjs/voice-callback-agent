@@ -5,9 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from livekit.agents import RunContext, StopResponse, function_tool
+from livekit.api import DeleteRoomRequest, TwirpError, TwirpErrorCode
+
+if TYPE_CHECKING:
+    from livekit.api import LiveKitAPI
 
 logger = logging.getLogger("agent.tools")
 
@@ -21,6 +25,9 @@ class SessionState:
     answers: dict[str, str] = field(default_factory=dict)
     call_ended: bool = False
     background_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
+    phone_mode: bool = False
+    room_name: str | None = None
+    api: LiveKitAPI | None = None
 
 
 def save_answer_to_state(state: SessionState, field_name: str, value: str) -> None:
@@ -46,8 +53,13 @@ async def save_answer(context: RunContext, field: str, value: str) -> str:
 async def _say_and_disconnect(
     session: Any,
     phrase: str,
+    state: SessionState | None = None,
 ) -> None:
-    """Speaks the termination phrase and closes the RTC session."""
+    """Speaks the termination phrase, waits for playout, and closes the RTC session.
+
+    In phone mode, room deletion is only executed after speech playout completes
+    so speech is never cut off.
+    """
     try:
         # Yield briefly so any pending events finalize in the runtime
         await asyncio.sleep(0.1)
@@ -56,11 +68,34 @@ async def _say_and_disconnect(
                 phrase,
                 allow_interruptions=False,
             )
-            await handle.wait_for_playout()
+            if handle is not None:
+                await handle.wait_for_playout()
     except Exception as e:
         logger.warning("Error during speech playout: %s", e)
     finally:
         await session.aclose()
+        if state and state.phone_mode and state.api and state.room_name:
+            try:
+                await state.api.room.delete_room(
+                    DeleteRoomRequest(room=state.room_name)
+                )
+                logger.info(
+                    "Deleted room '%s' to terminate phone call.", state.room_name
+                )
+            except TwirpError as e:
+                if e.code == TwirpErrorCode.NOT_FOUND:
+                    logger.debug(
+                        "Room '%s' was already deleted (not found).",
+                        state.room_name,
+                    )
+                else:
+                    logger.warning(
+                        "Twirp error deleting room '%s': %s",
+                        state.room_name,
+                        e,
+                    )
+            except Exception as e:
+                logger.warning("Error deleting room '%s': %s", state.room_name, e)
 
 
 def terminate_call(
@@ -77,7 +112,7 @@ def terminate_call(
         return None
     state.call_ended = True
 
-    task = asyncio.create_task(_say_and_disconnect(session, phrase))
+    task = asyncio.create_task(_say_and_disconnect(session, phrase, state))
     state.background_tasks.add(task)
     task.add_done_callback(state.background_tasks.discard)
     return task
