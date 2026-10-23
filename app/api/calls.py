@@ -31,14 +31,14 @@ DbSession = Annotated[AsyncSession, Depends(get_db)]
 
 # Single source of truth for the milestone board shown by the demo console.
 PROJECT_STAGES: tuple[StageOut, ...] = (
-    StageOut(id="M0", title="Setup", status="done"),
-    StageOut(id="M1", title="Voice agent in the browser", status="done"),
-    StageOut(id="M2", title="Real outbound phone call", status="done"),
-    StageOut(id="M3", title="Conversation quality", status="in_progress"),
-    StageOut(id="M4", title="Backend flow", status="in_progress"),
-    StageOut(id="M5", title="Summary and delivery", status="planned"),
-    StageOut(id="M6", title="Demo readiness", status="planned"),
-    StageOut(id="phone_go_live", title="Phone go-live", status="deferred"),
+    StageOut(id="M0", title="Налаштування", status="done"),
+    StageOut(id="M1", title="Агент у браузері", status="done"),
+    StageOut(id="M2", title="Код телефонного дзвінка", status="done"),
+    StageOut(id="M3", title="Якість розмови", status="in_progress"),
+    StageOut(id="M4", title="Бекенд і консоль", status="done"),
+    StageOut(id="M5", title="Резюме і доставка", status="planned"),
+    StageOut(id="M6", title="Готовність до демо", status="planned"),
+    StageOut(id="phone_go_live", title="Живий телефонний дзвінок", status="deferred"),
 )
 
 CALL_ENDED_EVENT = "call_ended"

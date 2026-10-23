@@ -211,13 +211,24 @@ async def test_overview_not_configured(async_client: httpx.AsyncClient) -> None:
     data = resp.json()
 
     assert data["stages"] == [s.model_dump() for s in PROJECT_STAGES]
+    titles = {s["id"]: s["title"] for s in data["stages"]}
+    assert titles == {
+        "M0": "Налаштування",
+        "M1": "Агент у браузері",
+        "M2": "Код телефонного дзвінка",
+        "M3": "Якість розмови",
+        "M4": "Бекенд і консоль",
+        "M5": "Резюме і доставка",
+        "M6": "Готовність до демо",
+        "phone_go_live": "Живий телефонний дзвінок",
+    }
     statuses = {s["id"]: s["status"] for s in data["stages"]}
     assert statuses == {
         "M0": "done",
         "M1": "done",
         "M2": "done",
         "M3": "in_progress",
-        "M4": "in_progress",
+        "M4": "done",
         "M5": "planned",
         "M6": "planned",
         "phone_go_live": "deferred",

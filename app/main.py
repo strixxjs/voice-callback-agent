@@ -1,11 +1,17 @@
+from pathlib import Path
+
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 from app.api.calls import router as calls_router
+from app.api.events import router as events_router
 from app.api.internal import router as internal_router
 from app.api.leads import router as leads_router
+
+STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(
     title="Voice Callback Agent",
@@ -16,6 +22,19 @@ app = FastAPI(
 app.include_router(internal_router)
 app.include_router(leads_router)
 app.include_router(calls_router)
+app.include_router(events_router)
+
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/", response_class=FileResponse)
+async def overview_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html", media_type="text/html")
+
+
+@app.get("/calls", response_class=FileResponse)
+async def calls_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "calls.html", media_type="text/html")
 
 
 @app.exception_handler(RequestValidationError)

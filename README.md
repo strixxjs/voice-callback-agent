@@ -188,7 +188,38 @@ curl -s http://localhost:8000/api/calls/<call_id>    # header + transcript + eve
 curl -s http://localhost:8000/api/overview           # milestone stages + component config status
 ```
 
-### 7. Run Tests and Linting
+### 7. Demo Console & Live SSE (M4)
+
+The demo console provides a 2-page web interface for testing the full voice callback flow:
+- **Огляд (`/`):** Test lead form (`POST /leads`), instant browser connection via LiveKit Client (microphone, remote audio, 60 s countdown, fallback links), visual call-flow pipeline, and project overview status.
+- **Дзвінки (`/calls`, `?id=<call_id>`):** Live call list, detailed call card with transcript chat bubbles, post-call extraction answers/missing keys, summary placeholder (M5), and event audit log.
+
+#### How to Open and Use the Console
+
+1. Ensure the PostgreSQL database, API server, and voice agent worker are running:
+   ```bash
+   # Terminal 1: PostgreSQL
+   docker compose up -d
+
+   # Terminal 2: API server
+   uv run uvicorn app.main:app --reload
+
+   # Terminal 3: Voice agent worker
+   uv run python -m agent.worker dev
+   ```
+
+2. Open the console in your browser:
+   ```
+   http://127.0.0.1:8000/
+   ```
+
+3. Fill out the "Тестовий лід" form (Name and E.164 Phone) and click **"Створити лід і підключитися"**. Allow microphone permissions in the browser prompt. The agent joins the room automatically and greets you within 30 seconds.
+
+> **Single-process & SSE Note:** Real-time updates are powered by Server-Sent Events (`GET /api/events`) using an in-process asyncio broadcaster. This requires a single `uvicorn` server process (default in local dev). On reconnection or page load, the frontend re-reads state via standard `GET` requests.
+>
+> **Local-Only & Security Note:** The demo console is intended solely for local development and client demonstrations (no authentication). Phone numbers are always masked, and session tokens remain strictly in memory and are never stored in localStorage or URLs.
+
+### 8. Run Tests and Linting
 
 Run test suite:
 

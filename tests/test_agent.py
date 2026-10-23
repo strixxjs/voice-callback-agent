@@ -712,15 +712,24 @@ async def test_entrypoint_room_closed_before_participant_joined(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verifies entrypoint logs info and returns cleanly on empty room RuntimeError."""
+    """Verifies entrypoint logs info, reports no_answer event and status,
+    and returns cleanly on empty room RuntimeError.
+    """
     from agent.worker import entrypoint
 
     monkeypatch.setattr(settings, "google_api_key", "test-key")
     monkeypatch.setattr(settings, "deepgram_api_key", "test-key")
     monkeypatch.setattr(settings, "elevenlabs_api_key", "test-key")
 
+    mock_reporter = MagicMock()
+    mock_reporter.is_noop = False
+    mock_reporter.aclose = AsyncMock()
+    monkeypatch.setattr("agent.worker.CallReporter", lambda **kw: mock_reporter)
+
     mock_ctx = MagicMock()
-    mock_ctx.job.metadata = None
+    mock_ctx.job.metadata = json.dumps(
+        {"call_id": "test-call-room-closed", "mode": "browser"}
+    )
     mock_ctx.room.name = "test-empty-room"
     mock_ctx.connect = AsyncMock()
     mock_ctx.wait_for_participant = AsyncMock(
@@ -734,6 +743,16 @@ async def test_entrypoint_room_closed_before_participant_joined(
     mock_ctx.connect.assert_awaited_once()
     mock_ctx.wait_for_participant.assert_awaited_once()
     assert "room closed before participant joined" in caplog.text
+    mock_reporter.report_event.assert_called_once_with(
+        "no_answer",
+        f"Participant did not join within {settings.participant_join_timeout} s",
+        {"timeout_seconds": settings.participant_join_timeout},
+    )
+    mock_reporter.report_ended.assert_called_once_with(
+        status="no_answer", duration_seconds=0, latency_summary=ANY
+    )
+    mock_reporter.report_extraction.assert_not_called()
+    mock_reporter.aclose.assert_awaited_once()
 
 
 def test_save_call_summary(tmp_path: Path) -> None:
@@ -845,7 +864,11 @@ async def test_entrypoint_join_timeout_reports_no_answer_once(
 
     await entrypoint(mock_ctx)
 
-    mock_reporter.report_event.assert_called_with("timeout", ANY)
+    mock_reporter.report_event.assert_called_once_with(
+        "no_answer",
+        f"Participant did not join within {settings.participant_join_timeout} s",
+        {"timeout_seconds": settings.participant_join_timeout},
+    )
     mock_reporter.report_ended.assert_called_once_with(
         status="no_answer", duration_seconds=0, latency_summary=ANY
     )

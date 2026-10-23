@@ -772,14 +772,16 @@ async def entrypoint(ctx: JobContext) -> None:
                 timeout=settings.participant_join_timeout,
             )
         except TimeoutError:
+            timeout_s = settings.participant_join_timeout
             logger.info(
                 "No participant joined room '%s' within %ss; closing as no_answer",
                 ctx.room.name,
-                settings.participant_join_timeout,
+                timeout_s,
             )
             reporter.report_event(
-                "timeout",
-                f"No participant joined within {settings.participant_join_timeout}s",
+                "no_answer",
+                f"Participant did not join within {timeout_s} s",
+                {"timeout_seconds": timeout_s},
             )
             await _finalize_session(status="no_answer")
             await _cleanup_and_shutdown(
@@ -787,7 +789,13 @@ async def entrypoint(ctx: JobContext) -> None:
             )
             return
         except RuntimeError:
+            timeout_s = settings.participant_join_timeout
             logger.info("room closed before participant joined")
+            reporter.report_event(
+                "no_answer",
+                f"Participant did not join within {timeout_s} s",
+                {"timeout_seconds": timeout_s},
+            )
             await _finalize_session(status="no_answer")
             return
 
