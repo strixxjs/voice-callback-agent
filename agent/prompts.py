@@ -101,7 +101,10 @@ def build_system_prompt(script: ScriptConfig) -> str:
           (even if answered earlier or out of order).
         - If an answer is unclear, ask ONE short clarification, then move on.
         - If an optional question is skipped or declined by the user, move on politely.
-        - When all questions are done or the caller wants to finish, call `end_call()`.
+        - Call `end_call()` ONLY AFTER the user has answered the last question
+          or clearly refused or asked to finish.
+        - NEVER ask a question and call `end_call()` in the same response;
+          always wait for the user's answer before ending the call.
         - Do NOT say goodbye or speak a farewell yourself in your reply;
           `end_call()` speaks the farewell closing phrase automatically.
         - NEVER call `end_call()` in the middle of the user's answer or while
