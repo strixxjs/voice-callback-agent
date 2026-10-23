@@ -141,6 +141,38 @@ def resolve_tts_voice(provider: str | None = None, voice_id: str | None = None) 
     return PROVIDER_DEFAULTS["tts_voice"].get(prov, DEFAULT_ELEVENLABS_VOICE_ID)
 
 
+def _sync_google_thought_signatures(primary_llm: Any, fallback_llm: Any) -> None:
+    """Share thought signatures dictionary between Google LLM instances.
+
+    Why:
+        Gemini 2.5+ and 3+ models require thought signatures on function call parts
+        in multi-turn history (Google API rejects missing signatures with HTTP 400).
+        In livekit-plugins-google (livekit/plugins/google/llm.py:318, 574, 881),
+        thought signatures are stored in `self._thought_signatures: dict[str, bytes]`.
+        When FallbackAdapter switches to fallback_llm, fallback_llm starts with an
+        empty dict and fails with HTTP 400 on any turn following previous tool calls.
+        Sharing the dictionary object ensures the fallback retains all thought
+        signatures from earlier turns.
+
+    Warning:
+        Relies on private attribute `_thought_signatures` in
+        livekit.plugins.google.llm.LLM. Must be rechecked on plugin upgrades.
+    """
+    if not hasattr(primary_llm, "_thought_signatures") or not hasattr(
+        fallback_llm, "_thought_signatures"
+    ):
+        logger.warning(
+            "Cannot sync Google thought signatures: '_thought_signatures' attribute "
+            "missing on primary (%s) or fallback (%s) LLM. "
+            "Check livekit-plugins-google.",
+            type(primary_llm).__name__,
+            type(fallback_llm).__name__,
+        )
+        return
+
+    fallback_llm._thought_signatures = primary_llm._thought_signatures
+
+
 def get_llm() -> Any:
     """Lazily instantiate configured LLM, optionally wrapped in FallbackAdapter."""
     provider = settings.llm_provider.lower()
@@ -151,6 +183,9 @@ def get_llm() -> Any:
         from livekit.agents.llm import FallbackAdapter
 
         fallback_llm = _create_llm_instance(provider, settings.llm_fallback_model)
+        if provider == "google":
+            _sync_google_thought_signatures(primary_llm, fallback_llm)
+
         logger.info(
             "Configuring LLM with FallbackAdapter: primary=%s, fallback=%s",
             primary_model,

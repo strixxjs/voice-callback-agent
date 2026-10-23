@@ -298,6 +298,49 @@ def test_get_llm_fallback_adapter_wrapping(monkeypatch: pytest.MonkeyPatch) -> N
     assert llm_instance._retry_interval == 0.5
 
 
+def test_get_llm_google_shares_thought_signatures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies that primary and fallback Google LLMs share _thought_signatures."""
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
+    monkeypatch.setattr(settings, "llm_provider", "google")
+    monkeypatch.setattr(settings, "llm_model", "gemini-3.5-flash-lite")
+    monkeypatch.setattr(settings, "llm_fallback_model", "gemini-3.5-flash")
+
+    llm_instance = get_llm()
+    primary, fallback = llm_instance._llm_instances
+
+    # 1. Both instances must share the exact same dictionary object
+    assert hasattr(primary, "_thought_signatures")
+    assert hasattr(fallback, "_thought_signatures")
+    assert primary._thought_signatures is fallback._thought_signatures
+
+    # 2. A signature written through primary must be visible through fallback
+    primary._thought_signatures["test_call_id"] = b"sig_bytes"
+    assert fallback._thought_signatures["test_call_id"] == b"sig_bytes"
+
+
+def test_sync_google_thought_signatures_missing_attribute(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies that missing _thought_signatures logs a warning and does not crash."""
+    from agent.worker import _sync_google_thought_signatures
+
+    class DummyLLM:
+        pass
+
+    primary = DummyLLM()
+    fallback = DummyLLM()
+
+    # Must not raise an exception
+    with caplog.at_level("WARNING"):
+        _sync_google_thought_signatures(primary, fallback)
+
+    assert "Cannot sync Google thought signatures" in caplog.text
+    assert "attribute missing" in caplog.text
+
+
+
 @pytest.mark.asyncio
 async def test_entrypoint_registers_async_shutdown_callback(
     monkeypatch: pytest.MonkeyPatch,
