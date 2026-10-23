@@ -1078,3 +1078,101 @@ async def test_entrypoint_on_session_close_called_once(
     await registered_cb()
 
     assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_entrypoint_session_close_event_triggers_shutdown_and_single_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies session 'close' event deletes room, triggers ctx.shutdown,
+    and finalizes once.
+    """
+    from livekit.agents.voice import CloseEvent
+
+    from agent.worker import _close_tasks, entrypoint
+
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
+    monkeypatch.setattr(settings, "deepgram_api_key", "test-key")
+    monkeypatch.setattr(settings, "elevenlabs_api_key", "test-key")
+
+    mock_reporter = MagicMock()
+    mock_reporter.is_noop = False
+    mock_reporter.aclose = AsyncMock()
+    monkeypatch.setattr("agent.worker.CallReporter", lambda **kw: mock_reporter)
+
+    async def mock_extract(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"status": "ok", "answers": {"name": "Eve"}, "missing": []}
+
+    monkeypatch.setattr("agent.worker.post_call_extraction_and_summary", mock_extract)
+
+    mock_ctx = MagicMock()
+    mock_ctx.job.metadata = json.dumps({"call_id": "test-call-close-event"})
+    mock_ctx.room.name = "test-close-room"
+    mock_ctx.connect = AsyncMock()
+    mock_ctx.api.room.delete_room = AsyncMock()
+    mock_participant = MagicMock(identity="user-5", name="Eve")
+    mock_ctx.wait_for_participant = AsyncMock(return_value=mock_participant)
+
+    captured_session = None
+    orig_attach = SessionMetricsCollector.attach_to_session
+
+    def spy_attach(self: Any, sess: Any) -> None:
+        nonlocal captured_session
+        captured_session = sess
+        orig_attach(self, sess)
+
+    monkeypatch.setattr(SessionMetricsCollector, "attach_to_session", spy_attach)
+
+    start_kwargs: dict[str, Any] = {}
+
+    async def spy_start(*args: Any, **kwargs: Any) -> None:
+        start_kwargs.update(kwargs)
+
+    with (
+        patch("agent.worker.AgentSession.start", side_effect=spy_start),
+        patch("agent.worker.AgentSession.say", new_callable=AsyncMock),
+    ):
+        await entrypoint(mock_ctx)
+
+    assert captured_session is not None
+    # 1. Verify delete_room_on_close was passed in browser mode
+    assert "room_options" in start_kwargs
+    assert start_kwargs["room_options"].delete_room_on_close is True
+
+    # 2. Emit the 'close' event on the session
+    close_event = CloseEvent(reason="user_initiated")
+    captured_session.emit("close", close_event)
+
+    # Allow the scheduled background task to run
+    if _close_tasks:
+        await asyncio.gather(*list(_close_tasks))
+
+    # 3. Verify room deletion and ctx.shutdown were called
+    mock_ctx.api.room.delete_room.assert_awaited_once()
+    assert mock_ctx.api.room.delete_room.call_args[0][0].room == "test-close-room"
+    mock_ctx.shutdown.assert_called_once_with(
+        reason=f"session closed: {close_event.reason}"
+    )
+
+    # 4. Trigger the shutdown callback (simulating framework shutdown lifecycle)
+    registered_cb = mock_ctx.add_shutdown_callback.call_args[0][0]
+    await registered_cb()
+
+    # 5. Verify call_ended event, /ended, extraction, and aclose
+    mock_reporter.report_event.assert_any_call(
+        "call_ended", "Call ended by user", {"ended_by": "user"}
+    )
+    mock_reporter.report_ended.assert_called_once_with(
+        status="completed", duration_seconds=ANY, latency_summary=ANY
+    )
+    mock_reporter.report_extraction.assert_called_once_with(
+        extracted_answers={"name": "Eve"},
+        extracted_missing=[],
+        extraction_status="ok",
+    )
+    mock_reporter.aclose.assert_awaited_once()
+
+    # 6. Verify calling registered_cb again does not double-finalize
+    await registered_cb()
+    mock_reporter.report_ended.assert_called_once()
+    mock_reporter.aclose.assert_awaited_once()
