@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     google_api_key: str | None = None
     openai_api_key: str | None = None
 
+    # Post-call Extraction
+    extraction_model: str = "gemini-3.5-flash"
+    extraction_timeout: float = 15.0
+
     stt_provider: str = "deepgram"
     stt_model: str | None = None
     # Optional STT language override; if None, language from script.yaml is used
