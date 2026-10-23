@@ -47,9 +47,12 @@ def extract_job_phone_number(job_metadata: str | None) -> tuple[bool, str | None
         return False, None
     try:
         data = json.loads(job_metadata)
-        if isinstance(data, dict) and "phone_number" in data:
-            val = data["phone_number"]
-            return True, str(val).strip() if val is not None else ""
+        if isinstance(data, dict):
+            if data.get("mode") == "browser":
+                return False, None
+            if "phone_number" in data:
+                val = data["phone_number"]
+                return True, str(val).strip() if val is not None else ""
     except (json.JSONDecodeError, TypeError):
         pass
     return False, None
