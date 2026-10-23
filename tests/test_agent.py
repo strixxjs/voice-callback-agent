@@ -21,7 +21,13 @@ from agent.extraction import (
 from agent.metrics import SessionMetricsCollector
 from agent.prompts import QuestionItem, ScriptConfig, build_system_prompt, load_script
 from agent.telephony import mask_phone_number
-from agent.tools import SessionState, end_call, terminate_call
+from agent.tools import (
+    SessionState,
+    end_call,
+    has_pending_agent_question,
+    is_question_text,
+    terminate_call,
+)
 from agent.worker import (
     VoiceCallbackAgent,
     extract_transcript,
@@ -144,6 +150,8 @@ def test_build_system_prompt_rules() -> None:
     assert "Question 'budget'" in prompt
     assert "end_call" in prompt
     assert "farewell" in prompt.lower()
+    assert "only after the user has answered the last question" in prompt.lower()
+    assert "never ask a question and call `end_call()`" in prompt.lower()
 
 
 def test_build_system_prompt_language_switch() -> None:
@@ -315,6 +323,299 @@ async def test_end_call_logs_warning_on_playout_exception(
         if "wait_for_playout in end_call" in r.message and r.levelname == "WARNING"
     ]
     assert len(warning_records) == 1
+
+
+def test_is_question_text_detection() -> None:
+    """Verifies question mark detection with various punctuations and quotes."""
+    # Positive cases
+    assert (
+        is_question_text(
+            "О котрій годині нашому менеджеру буде найзручніше вам зателефонувати?"
+        )
+        is True
+    )
+    assert is_question_text("Зручно зараз говорити? ") is True
+    assert is_question_text("Чи можу я уточнити ваше ім'я?") is True
+    assert is_question_text("What time is best for a callback?") is True
+    assert is_question_text("Jak masz na imię?") is True
+    assert is_question_text("«Зручно говорити?»") is True
+    assert is_question_text('"Ви впевнені?"') is True
+    assert is_question_text("Справді?!") is True
+    assert is_question_text("Коли саме?...") is True
+    assert is_question_text("Зручно?.)") is True
+
+    # Negative cases
+    assert is_question_text("Дякую за розмову!") is False
+    assert is_question_text("Менеджер зв'яжеться з вами.") is False
+    assert is_question_text("це все, до побачення") is False
+    assert is_question_text("не хочу говорити") is False
+    assert is_question_text("") is False
+    assert is_question_text(None) is False
+
+
+def test_has_pending_agent_question_decision() -> None:
+    """Verifies decision: question pending -> reject;
+    user answered / requested finish -> allow.
+    """
+    last_q = "О котрій годині нашому менеджеру буде найзручніше вам зателефонувати?"
+
+    # 1. Question pending in current generation -> reject (True)
+    assert has_pending_agent_question(current_generation_text=last_q) is True
+
+    # 2. Question pending in history (no subsequent user message) -> reject (True)
+    messages_pending_history = [
+        {"role": "user", "content": "Привіт"},
+        {"role": "assistant", "content": last_q},
+    ]
+    assert has_pending_agent_question(messages=messages_pending_history) is True
+
+    # ChatContext variant of pending question in history
+    ctx_pending = llm.ChatContext()
+    ctx_pending.add_message(role="assistant", content="Як вас звати?")
+    ctx_pending.add_message(role="user", content="Олексій")
+    ctx_pending.add_message(role="assistant", content=last_q)
+    assert has_pending_agent_question(messages=ctx_pending.messages()) is True
+
+    # 3. User answered after agent question -> allow (False)
+    messages_answered = [
+        {"role": "assistant", "content": last_q},
+        {"role": "user", "content": "О 15:00"},
+    ]
+    assert has_pending_agent_question(messages=messages_answered) is False
+
+    ctx_answered = llm.ChatContext()
+    ctx_answered.add_message(role="assistant", content=last_q)
+    ctx_answered.add_message(role="user", content="Завтра після 14:00")
+    assert has_pending_agent_question(messages=ctx_answered.messages()) is False
+
+    # 4. User asked to finish after agent question -> allow (False)
+    messages_finish_phrase_1 = [
+        {"role": "assistant", "content": last_q},
+        {"role": "user", "content": "це все"},
+    ]
+    assert has_pending_agent_question(messages=messages_finish_phrase_1) is False
+
+    messages_finish_phrase_2 = [
+        {"role": "assistant", "content": last_q},
+        {"role": "user", "content": "до побачення"},
+    ]
+    assert has_pending_agent_question(messages=messages_finish_phrase_2) is False
+
+    messages_refuse = [
+        {"role": "assistant", "content": last_q},
+        {"role": "user", "content": "не хочу говорити"},
+    ]
+    assert has_pending_agent_question(messages=messages_refuse) is False
+
+    # 5. No question asked (statement / empty) -> allow (False)
+    messages_no_question = [
+        {"role": "assistant", "content": "Дякую, всі дані зафіксовано."},
+    ]
+    assert has_pending_agent_question(messages=messages_no_question) is False
+    assert has_pending_agent_question(messages=[]) is False
+    assert has_pending_agent_question(current_generation_text="Дякую!") is False
+
+
+@pytest.mark.asyncio
+async def test_end_call_rejected_when_question_pending_in_current_generation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies end_call returns None and logs warning if current speech
+    generation asked a question.
+    """
+    question = "О котрій годині нашому менеджеру буде найзручніше вам зателефонувати?"
+    state = SessionState(closing_phrase="Дякую за розмову! До побачення!")
+
+    chat_ctx = llm.ChatContext()
+    agent_msg = chat_ctx.add_message(role="assistant", content=question)
+
+    mock_speech_handle = MagicMock()
+    mock_speech_handle.chat_items = [agent_msg]
+
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.history = chat_ctx
+    mock_session.say = MagicMock()
+    mock_session.aclose = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.userdata = state
+    mock_context.session = mock_session
+    mock_context.speech_handle = mock_speech_handle
+    mock_context.wait_for_playout = AsyncMock()
+
+    result = await end_call(mock_context)
+
+    # Must return None so agent waits without generating another LLM turn
+    assert result is None
+    assert state.call_ended is False
+    assert len(state.background_tasks) == 0
+    mock_session.say.assert_not_called()
+    mock_session.aclose.assert_not_called()
+
+    # Guard warning must be logged
+    warning_logs = [
+        r.message
+        for r in caplog.records
+        if "end_call rejected: pending question" in r.message
+        and r.levelname == "WARNING"
+    ]
+    assert len(warning_logs) == 1
+
+
+@pytest.mark.asyncio
+async def test_end_call_rejected_when_question_pending_in_history(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies end_call returns None and logs warning when last agent turn
+    in history was a question.
+    """
+    question = "Чи можу я уточнити ваше ім'я та прізвище?"
+    state = SessionState(closing_phrase="До побачення!")
+
+    chat_ctx = llm.ChatContext()
+    chat_ctx.add_message(role="user", content="Доброго дня")
+    chat_ctx.add_message(role="assistant", content=question)
+
+    mock_speech_handle = MagicMock()
+    mock_speech_handle.chat_items = []
+
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.history = chat_ctx
+    mock_session.say = MagicMock()
+    mock_session.aclose = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.userdata = state
+    mock_context.session = mock_session
+    mock_context.speech_handle = mock_speech_handle
+    mock_context.wait_for_playout = AsyncMock()
+
+    result = await end_call(mock_context)
+
+    assert result is None
+    assert state.call_ended is False
+    assert len(state.background_tasks) == 0
+    mock_session.say.assert_not_called()
+    mock_session.aclose.assert_not_called()
+
+    warning_logs = [
+        r.message
+        for r in caplog.records
+        if "end_call rejected: pending question" in r.message
+        and r.levelname == "WARNING"
+    ]
+    assert len(warning_logs) == 1
+
+
+@pytest.mark.asyncio
+async def test_end_call_allowed_when_user_answered() -> None:
+    """Verifies end_call terminates when user responded to the last agent question."""
+    closing = "Дякую за розмову! До побачення!"
+    state = SessionState(closing_phrase=closing)
+
+    chat_ctx = llm.ChatContext()
+    chat_ctx.add_message(
+        role="assistant",
+        content="О котрій годині нашому менеджеру буде найзручніше вам зателефонувати?",
+    )
+    chat_ctx.add_message(role="user", content="О 15:00")
+
+    mock_handle = MagicMock()
+    mock_handle.wait_for_playout = AsyncMock()
+
+    mock_speech_handle = MagicMock()
+    mock_speech_handle.chat_items = []
+
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.history = chat_ctx
+    mock_session.say = MagicMock(return_value=mock_handle)
+    mock_session.aclose = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.userdata = state
+    mock_context.session = mock_session
+    mock_context.speech_handle = mock_speech_handle
+    mock_context.wait_for_playout = AsyncMock()
+
+    with pytest.raises(StopResponse):
+        await end_call(mock_context)
+
+    assert state.call_ended is True
+    assert len(state.background_tasks) == 1
+    for task in list(state.background_tasks):
+        await task
+    mock_session.say.assert_called_once_with(closing, allow_interruptions=False)
+    mock_session.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_end_call_allowed_when_user_requested_to_finish() -> None:
+    """Verifies end_call terminates when caller explicitly asks to finish."""
+    closing = "Дякую за розмову! До побачення!"
+    state = SessionState(closing_phrase=closing)
+
+    chat_ctx = llm.ChatContext()
+    chat_ctx.add_message(role="assistant", content="Яка послуга вас цікавить?")
+    chat_ctx.add_message(role="user", content="це все, до побачення")
+
+    mock_handle = MagicMock()
+    mock_handle.wait_for_playout = AsyncMock()
+
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.history = chat_ctx
+    mock_session.say = MagicMock(return_value=mock_handle)
+    mock_session.aclose = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.userdata = state
+    mock_context.session = mock_session
+    mock_context.wait_for_playout = AsyncMock()
+
+    with pytest.raises(StopResponse):
+        await end_call(mock_context)
+
+    assert state.call_ended is True
+    for task in list(state.background_tasks):
+        await task
+    mock_session.say.assert_called_once_with(closing, allow_interruptions=False)
+
+
+@pytest.mark.asyncio
+async def test_end_call_allowed_when_no_question_asked() -> None:
+    """Verifies end_call terminates when last agent message was a statement
+    rather than a question.
+    """
+    closing = "Дякую за розмову! До побачення!"
+    state = SessionState(closing_phrase=closing)
+
+    chat_ctx = llm.ChatContext()
+    chat_ctx.add_message(role="assistant", content="Дякую, вся інформація записана.")
+
+    mock_handle = MagicMock()
+    mock_handle.wait_for_playout = AsyncMock()
+
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.history = chat_ctx
+    mock_session.say = MagicMock(return_value=mock_handle)
+    mock_session.aclose = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.userdata = state
+    mock_context.session = mock_session
+    mock_context.wait_for_playout = AsyncMock()
+
+    with pytest.raises(StopResponse):
+        await end_call(mock_context)
+
+    assert state.call_ended is True
+    for task in list(state.background_tasks):
+        await task
+    mock_session.say.assert_called_once_with(closing, allow_interruptions=False)
 
 
 def test_extract_transcript_and_summary() -> None:
