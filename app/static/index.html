@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Огляд — Демо-консоль голосового агента</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Manrope:wght@600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client@2.23.0/dist/livekit-client.umd.min.js"></script>
+</head>
+<body>
+  <header class="header">
+    <div class="header-inner">
+      <div class="brand">
+        <div class="brand-logo">S</div>
+        <div class="brand-text">Solaris Voice Agent</div>
+        <span class="brand-badge">M4 Demo</span>
+      </div>
+
+      <nav class="nav-links">
+        <a href="/" class="nav-link active">Огляд</a>
+        <a href="/calls" class="nav-link">Дзвінки</a>
+      </nav>
+
+      <div class="header-status">
+        <span id="sse-dot" class="status-dot"></span>
+        <span id="sse-text">SSE: підключення...</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="main">
+    <section class="hero-banner">
+      <h1>ШІ-асистент телефонних дзвінків</h1>
+      <p>Лід залишає заявку на сайті &rarr; система ініціює дзвінок за &lt; 30 с &rarr; ШІ-асистентка Саня проводить кваліфікаційну розмову, а відповіді збираються в картку дзвінка; резюме й передача менеджеру (CRM / Telegram) — у M5.</p>
+    </section>
+
+    <div class="grid-2col">
+      <!-- Left Column: Test Lead Intake Form & Active Call Session -->
+      <div>
+        <div class="card">
+          <h2 class="card-title">Тестовий лід</h2>
+          <form id="lead-form">
+            <div class="form-group">
+              <label class="form-label" for="lead-name">Ваше ім'я</label>
+              <input type="text" id="lead-name" class="form-input" placeholder="Олексій" required>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="lead-phone">Номер телефону</label>
+              <input type="tel" id="lead-phone" class="form-input" placeholder="+380501234567" required>
+              <div class="form-hint">Формат E.164 з кодом країни (+380...)</div>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Режим дзвінка</label>
+              <div class="mode-selector">
+                <label class="mode-option active">
+                  <input type="radio" name="mode" value="browser" checked>
+                  <span>Браузер</span>
+                </label>
+                <label class="mode-option disabled" title="доступно після Phone go-live">
+                  <input type="radio" name="mode" value="phone" disabled>
+                  <span>Телефон</span>
+                </label>
+              </div>
+              <div class="form-hint">Телефонний режим буде активовано на етапі Phone go-live.</div>
+            </div>
+
+            <div id="form-error" class="error-box"></div>
+
+            <button type="submit" id="submit-btn" class="btn btn-primary btn-block">
+              Створити лід і підключитися
+            </button>
+          </form>
+
+          <!-- Active Call Connection Panel -->
+          <div id="connection-panel" class="connection-panel">
+            <h3 class="card-title" style="margin-bottom: 12px; font-size: 14px;">
+              <span>Активна сесія дзвінка</span>
+              <span id="call-status-badge"></span>
+            </h3>
+
+            <div class="meta-row">
+              <span class="meta-label">ID дзвінка:</span>
+              <span id="conn-call-id" class="meta-value"></span>
+            </div>
+            <div class="meta-row">
+              <span class="meta-label">Кімната:</span>
+              <span id="conn-room" class="meta-value"></span>
+            </div>
+            <div class="meta-row">
+              <span class="meta-label">Режим:</span>
+              <span class="meta-value">Браузер</span>
+            </div>
+            <div class="meta-row">
+              <span class="meta-label">Аудіо / Мікрофон:</span>
+              <span id="conn-audio-status" class="meta-value" style="color: var(--accent);">Увімкнено</span>
+            </div>
+
+            <div id="countdown-box" class="countdown-hint">
+              <span id="countdown-text">Очікуємо підключення агента: <strong id="countdown-num">60</strong> с</span>
+            </div>
+
+            <div id="audio-blocked-alert" style="display: none; margin-bottom: 12px;">
+              <button type="button" id="start-audio-btn" class="btn btn-warning btn-block">
+                🔊 Увімкнути звук розмови
+              </button>
+            </div>
+
+            <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px;">
+              <button type="button" id="disconnect-btn" class="btn btn-danger" style="flex: 1;">
+                Завершити дзвінок
+              </button>
+              <a id="meet-btn" href="#" target="_blank" class="btn btn-secondary" style="flex: 1; text-align: center;">
+                LiveKit Meet ↗
+              </a>
+              <a id="call-details-btn" href="#" class="btn btn-secondary" style="flex: 1; text-align: center;">
+                Картка дзвінка &rarr;
+              </a>
+            </div>
+          </div>
+        </div>
+
+        <!-- Call-flow static scheme -->
+        <div class="card">
+          <h2 class="card-title">Схема процесу (Call Flow)</h2>
+          <div class="flow-steps">
+            <div class="flow-step">
+              <div class="flow-num">1</div>
+              <div class="flow-info">
+                <div class="flow-title">Заявка (POST /leads)</div>
+                <div class="flow-desc">Збереження ліда та ініціація дзвінка у Postgres DB</div>
+              </div>
+            </div>
+            <div class="flow-step">
+              <div class="flow-num">2</div>
+              <div class="flow-info">
+                <div class="flow-title">Диспетчер (LiveKit)</div>
+                <div class="flow-desc">Створення кімнати та підключення агента за &lt; 30 с</div>
+              </div>
+            </div>
+            <div class="flow-step">
+              <div class="flow-num">3</div>
+              <div class="flow-info">
+                <div class="flow-title">Голосова взаємодія</div>
+                <div class="flow-desc">Deepgram STT &rarr; Gemini LLM &rarr; ElevenLabs TTS</div>
+              </div>
+            </div>
+            <div class="flow-step">
+              <div class="flow-num">4</div>
+              <div class="flow-info">
+                <div class="flow-title">Завершення (end_call)</div>
+                <div class="flow-desc">Фіксація тривалості, затримок та подій сесії</div>
+              </div>
+            </div>
+            <div class="flow-step">
+              <div class="flow-num">5</div>
+              <div class="flow-info">
+                <div class="flow-title">Екстракція даних</div>
+                <div class="flow-desc">Вилучення імені, послуги, термінів та часу дзвінка</div>
+              </div>
+            </div>
+            <div class="flow-step">
+              <div class="flow-num">6</div>
+              <div class="flow-info">
+                <div class="flow-title">Передача в CRM / Менеджеру</div>
+                <div class="flow-desc">Сповіщення в Telegram та запис у таблицю (план M5)</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right Column: System Stages & Components Overview -->
+      <div>
+        <div class="card">
+          <h2 class="card-title">Статус компонентів системи</h2>
+          <table class="items-table">
+            <thead>
+              <tr>
+                <th>Компонент</th>
+                <th>Провайдер</th>
+                <th>Статус</th>
+              </tr>
+            </thead>
+            <tbody id="components-tbody">
+              <tr><td colspan="3" class="empty-state">Завантаження компонентів...</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2 class="card-title">Етапи розробки (Milestones)</h2>
+          <table class="items-table">
+            <thead>
+              <tr>
+                <th>Етап</th>
+                <th>Назва</th>
+                <th>Статус</th>
+              </tr>
+            </thead>
+            <tbody id="stages-tbody">
+              <tr><td colspan="3" class="empty-state">Завантаження етапів...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script src="/static/common.js"></script>
+  <script src="/static/overview.js"></script>
+</body>
+</html>

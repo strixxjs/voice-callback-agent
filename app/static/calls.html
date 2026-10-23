@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Дзвінки — Демо-консоль голосового агента</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Manrope:wght@600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="header">
+    <div class="header-inner">
+      <div class="brand">
+        <div class="brand-logo">S</div>
+        <div class="brand-text">Solaris Voice Agent</div>
+        <span class="brand-badge">M4 Demo</span>
+      </div>
+
+      <nav class="nav-links">
+        <a href="/" class="nav-link">Огляд</a>
+        <a href="/calls" class="nav-link active">Дзвінки</a>
+      </nav>
+
+      <div class="header-status">
+        <span id="sse-dot" class="status-dot"></span>
+        <span id="sse-text">SSE: підключення...</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="main">
+    <div class="calls-layout">
+      <!-- Left Column: Calls List -->
+      <aside class="calls-list-panel">
+        <div class="calls-list-header">
+          <h2 style="font-size: 16px;">Список дзвінків</h2>
+          <span id="calls-count" style="font-size: 12px; color: var(--faint); font-family: var(--font-mono);">0 дзвінків</span>
+        </div>
+
+        <div id="calls-list" class="calls-scroll">
+          <div class="empty-state">Завантаження дзвінків...</div>
+        </div>
+      </aside>
+
+      <!-- Right Column: Call Details -->
+      <section class="call-detail-panel">
+        <div id="detail-empty" class="empty-state" style="padding: 100px 20px;">
+          Виберіть дзвінок зі списку ліворуч для перегляду деталей.
+        </div>
+
+        <div id="detail-content" style="display: none; flex-direction: column; gap: 20px;">
+          <!-- Header Card -->
+          <div class="detail-header-card">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+              <div>
+                <h1 id="detail-name" style="font-size: 20px; margin-bottom: 2px;">—</h1>
+                <div id="detail-phone" style="font-family: var(--font-mono); color: var(--muted); font-size: 13px;">—</div>
+              </div>
+              <div id="detail-status-badge"></div>
+            </div>
+
+            <div class="detail-grid">
+              <div class="detail-item">
+                <div class="detail-item-label">ID дзвінка</div>
+                <div id="detail-id" class="detail-item-val" style="color: var(--accent); font-size: 11px;">—</div>
+              </div>
+              <div class="detail-item">
+                <div class="detail-item-label">Кімната</div>
+                <div id="detail-room" class="detail-item-val" style="font-size: 11px;">—</div>
+              </div>
+              <div class="detail-item">
+                <div class="detail-item-label">Режим</div>
+                <div id="detail-mode" class="detail-item-val">—</div>
+              </div>
+              <div class="detail-item">
+                <div class="detail-item-label">Час початку</div>
+                <div id="detail-started" class="detail-item-val">—</div>
+              </div>
+              <div class="detail-item">
+                <div class="detail-item-label">Тривалість</div>
+                <div id="detail-duration" class="detail-item-val">—</div>
+              </div>
+              <div class="detail-item">
+                <div class="detail-item-label">Завершено ким</div>
+                <div id="detail-ended-by" class="detail-item-val">—</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Transcript Section -->
+          <div class="card" style="padding: 18px;">
+            <h3 class="card-title">Транскрипт розмови</h3>
+            <div id="detail-transcript" class="transcript-box">
+              <div class="empty-state">Транскрипт порожній або дзвінок ще триває.</div>
+            </div>
+          </div>
+
+          <!-- Extraction Section -->
+          <div class="card" style="padding: 18px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+              <h3 class="card-title" style="margin-bottom: 0;">Екстракція відповідей</h3>
+              <div id="detail-extraction-badge"></div>
+            </div>
+
+            <div id="detail-extraction-answers" class="answers-grid">
+              <div class="empty-state">Екстракція очікується після завершення дзвінка.</div>
+            </div>
+
+            <div id="detail-extraction-missing-box" style="display: none; margin-top: 12px; font-size: 12px; color: var(--warning);">
+              <span>Пропущені поля: </span>
+              <span id="detail-extraction-missing" style="font-family: var(--font-mono);"></span>
+            </div>
+          </div>
+
+          <!-- Summary Placeholder (M5) -->
+          <div class="card" style="padding: 18px;">
+            <h3 class="card-title">Підсумок для менеджера</h3>
+            <div class="placeholder-box">
+              <span style="font-size: 20px;">📋</span>
+              <div>
+                <strong>Резюме — у M5</strong>
+                <div style="font-size: 12px; color: var(--faint);">Генерація короткого аналітичного підсумку розмови для менеджера та відправка в Telegram/CRM заплановані в наступному етапі (M5: Summary and delivery).</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Event Log Section -->
+          <div class="card" style="padding: 18px;">
+            <h3 class="card-title">Журнал подій (Event Log)</h3>
+            <div id="detail-events" class="event-log-box">
+              <div class="empty-state">Подій ще немає.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script src="/static/common.js"></script>
+  <script src="/static/calls.js"></script>
+</body>
+</html>
