@@ -7,7 +7,7 @@ import inspect
 import json
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from livekit.agents import StopResponse, llm
@@ -18,6 +18,7 @@ from agent.extraction import (
     format_short_error,
     save_call_summary,
 )
+from agent.metrics import SessionMetricsCollector
 from agent.prompts import QuestionItem, ScriptConfig, build_system_prompt, load_script
 from agent.telephony import mask_phone_number
 from agent.tools import SessionState, end_call, terminate_call
@@ -817,3 +818,263 @@ async def test_post_call_extraction_and_summary_worker(
     assert summary["missing"] == ["timeline", "preferred_call_time"]
     assert state.answers["name"] == "Тарас"
     assert (calls_dir / "test-room-extraction.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_entrypoint_join_timeout_reports_no_answer_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies join-timeout reports ended=no_answer once, no extraction, and closes."""
+    from agent.worker import entrypoint
+
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
+    monkeypatch.setattr(settings, "deepgram_api_key", "test-key")
+    monkeypatch.setattr(settings, "elevenlabs_api_key", "test-key")
+
+    mock_reporter = MagicMock()
+    mock_reporter.is_noop = False
+    mock_reporter.aclose = AsyncMock()
+    monkeypatch.setattr("agent.worker.CallReporter", lambda **kw: mock_reporter)
+
+    mock_ctx = MagicMock()
+    mock_ctx.job.metadata = json.dumps({"call_id": "test-call-123", "mode": "browser"})
+    mock_ctx.room.name = "test-timeout-room"
+    mock_ctx.connect = AsyncMock()
+    mock_ctx.wait_for_participant = AsyncMock(side_effect=TimeoutError())
+    mock_ctx.api.room.delete_room = AsyncMock()
+
+    await entrypoint(mock_ctx)
+
+    mock_reporter.report_event.assert_called_with("timeout", ANY)
+    mock_reporter.report_ended.assert_called_once_with(
+        status="no_answer", duration_seconds=0, latency_summary=ANY
+    )
+    mock_reporter.report_extraction.assert_not_called()
+    mock_reporter.aclose.assert_awaited_once()
+
+    # Call registered shutdown callback; must not invoke report_ended again
+    registered_cb = mock_ctx.add_shutdown_callback.call_args[0][0]
+    await registered_cb()
+    mock_reporter.report_ended.assert_called_once()
+    mock_reporter.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_entrypoint_user_hangup_reports_completed_and_ended_by_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies user hangup records ended=completed and call_ended with
+    ended_by=user.
+    """
+    from agent.worker import entrypoint
+
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
+    monkeypatch.setattr(settings, "deepgram_api_key", "test-key")
+    monkeypatch.setattr(settings, "elevenlabs_api_key", "test-key")
+
+    mock_reporter = MagicMock()
+    mock_reporter.is_noop = False
+    mock_reporter.aclose = AsyncMock()
+    monkeypatch.setattr("agent.worker.CallReporter", lambda **kw: mock_reporter)
+
+    async def mock_extract(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "answers": {"name": "Bob"},
+            "missing": [],
+        }
+
+    monkeypatch.setattr("agent.worker.post_call_extraction_and_summary", mock_extract)
+
+    mock_ctx = MagicMock()
+    mock_ctx.job.metadata = json.dumps({"call_id": "test-call-user-hangup"})
+    mock_ctx.room.name = "test-user-hangup-room"
+    mock_ctx.connect = AsyncMock()
+
+    mock_participant = MagicMock()
+    mock_participant.identity = "user-1"
+    mock_participant.name = "Bob"
+    mock_ctx.wait_for_participant = AsyncMock(return_value=mock_participant)
+
+    with (
+        patch("agent.worker.AgentSession.start", new_callable=AsyncMock),
+        patch("agent.worker.AgentSession.say", new_callable=AsyncMock),
+    ):
+        await entrypoint(mock_ctx)
+
+    # Trigger shutdown callback (simulating user disconnect: call_ended=False)
+    registered_cb = mock_ctx.add_shutdown_callback.call_args[0][0]
+    await registered_cb()
+
+    mock_reporter.report_event.assert_any_call(
+        "call_ended", "Call ended by user", {"ended_by": "user"}
+    )
+    mock_reporter.report_ended.assert_called_once_with(
+        status="completed", duration_seconds=ANY, latency_summary=ANY
+    )
+    mock_reporter.report_extraction.assert_called_once_with(
+        extracted_answers={"name": "Bob"},
+        extracted_missing=[],
+        extraction_status="ok",
+    )
+    mock_reporter.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_entrypoint_agent_hangup_reports_ended_by_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies agent termination records call_ended event with ended_by=agent."""
+    from agent.worker import entrypoint
+
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
+    monkeypatch.setattr(settings, "deepgram_api_key", "test-key")
+    monkeypatch.setattr(settings, "elevenlabs_api_key", "test-key")
+
+    mock_reporter = MagicMock()
+    mock_reporter.is_noop = False
+    mock_reporter.aclose = AsyncMock()
+    monkeypatch.setattr("agent.worker.CallReporter", lambda **kw: mock_reporter)
+
+    async def mock_extract(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"status": "ok", "answers": {}, "missing": []}
+
+    monkeypatch.setattr("agent.worker.post_call_extraction_and_summary", mock_extract)
+
+    mock_ctx = MagicMock()
+    mock_ctx.job.metadata = json.dumps({"call_id": "test-call-agent-hangup"})
+    mock_ctx.room.name = "test-agent-hangup-room"
+    mock_ctx.connect = AsyncMock()
+    mock_participant = MagicMock(identity="user-2", name="Alice")
+    mock_ctx.wait_for_participant = AsyncMock(return_value=mock_participant)
+
+    captured_session = None
+    orig_attach = SessionMetricsCollector.attach_to_session
+
+    def spy_attach(self: Any, sess: Any) -> None:
+        nonlocal captured_session
+        captured_session = sess
+        orig_attach(self, sess)
+
+    monkeypatch.setattr(SessionMetricsCollector, "attach_to_session", spy_attach)
+
+    with (
+        patch("agent.worker.AgentSession.start", new_callable=AsyncMock),
+        patch("agent.worker.AgentSession.say", new_callable=AsyncMock),
+    ):
+        await entrypoint(mock_ctx)
+
+    assert captured_session is not None
+    # Simulate end_call tool having terminated the call
+    captured_session.userdata.call_ended = True
+
+    registered_cb = mock_ctx.add_shutdown_callback.call_args[0][0]
+    await registered_cb()
+
+    mock_reporter.report_event.assert_any_call(
+        "call_ended", "Call ended by agent", {"ended_by": "agent"}
+    )
+    mock_reporter.report_ended.assert_called_once_with(
+        status="completed", duration_seconds=ANY, latency_summary=ANY
+    )
+
+
+@pytest.mark.asyncio
+async def test_entrypoint_extraction_exception_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies post-call extraction error reports extraction_failed with all
+    question keys.
+    """
+    from agent.worker import entrypoint
+
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
+    monkeypatch.setattr(settings, "deepgram_api_key", "test-key")
+    monkeypatch.setattr(settings, "elevenlabs_api_key", "test-key")
+
+    mock_reporter = MagicMock()
+    mock_reporter.is_noop = False
+    mock_reporter.aclose = AsyncMock()
+    monkeypatch.setattr("agent.worker.CallReporter", lambda **kw: mock_reporter)
+
+    async def mock_extract_fail(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("LLM rate limit reached")
+
+    monkeypatch.setattr(
+        "agent.worker.post_call_extraction_and_summary", mock_extract_fail
+    )
+
+    mock_ctx = MagicMock()
+    mock_ctx.job.metadata = json.dumps({"call_id": "test-call-fail"})
+    mock_ctx.room.name = "test-fail-room"
+    mock_ctx.connect = AsyncMock()
+    mock_participant = MagicMock(identity="user-3", name="Charlie")
+    mock_ctx.wait_for_participant = AsyncMock(return_value=mock_participant)
+
+    with (
+        patch("agent.worker.AgentSession.start", new_callable=AsyncMock),
+        patch("agent.worker.AgentSession.say", new_callable=AsyncMock),
+    ):
+        await entrypoint(mock_ctx)
+
+    registered_cb = mock_ctx.add_shutdown_callback.call_args[0][0]
+    await registered_cb()
+
+    script = load_script()
+    mock_reporter.report_extraction.assert_called_once_with(
+        extracted_answers={},
+        extracted_missing=list(script.question_fields),
+        extraction_status="extraction_failed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_entrypoint_on_session_close_called_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies metrics_collector.on_session_close() is called exactly once per
+    session.
+    """
+    from agent.worker import entrypoint
+
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
+    monkeypatch.setattr(settings, "deepgram_api_key", "test-key")
+    monkeypatch.setattr(settings, "elevenlabs_api_key", "test-key")
+
+    mock_reporter = MagicMock()
+    mock_reporter.is_noop = False
+    mock_reporter.aclose = AsyncMock()
+    monkeypatch.setattr("agent.worker.CallReporter", lambda **kw: mock_reporter)
+
+    close_calls = 0
+    orig_close = SessionMetricsCollector.on_session_close
+
+    def spy_close(self: Any) -> dict[str, Any]:
+        nonlocal close_calls
+        close_calls += 1
+        return orig_close(self)
+
+    monkeypatch.setattr(SessionMetricsCollector, "on_session_close", spy_close)
+
+    mock_ctx = MagicMock()
+    mock_ctx.job.metadata = json.dumps({"call_id": "test-call-close-once"})
+    mock_ctx.room.name = "test-close-room"
+    mock_ctx.connect = AsyncMock()
+    mock_participant = MagicMock(identity="user-4", name="Dana")
+    mock_ctx.wait_for_participant = AsyncMock(return_value=mock_participant)
+
+    async def mock_extract(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"status": "ok", "answers": {}, "missing": []}
+
+    monkeypatch.setattr("agent.worker.post_call_extraction_and_summary", mock_extract)
+
+    with (
+        patch("agent.worker.AgentSession.start", new_callable=AsyncMock),
+        patch("agent.worker.AgentSession.say", new_callable=AsyncMock),
+    ):
+        await entrypoint(mock_ctx)
+
+    registered_cb = mock_ctx.add_shutdown_callback.call_args[0][0]
+    await registered_cb()
+
+    assert close_calls == 1
