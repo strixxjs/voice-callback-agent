@@ -52,4 +52,5 @@ outbound-trunk.json
 .DS_Store
 Thumbs.db
 *Zone.Identifier
-*:Zone.Identifier
+# Application logs
+logs/
