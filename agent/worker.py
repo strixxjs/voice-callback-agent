@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
 import os
+import time
 import uuid
 from typing import Any
 
@@ -35,6 +37,11 @@ from agent.extraction import (
 )
 from agent.metrics import ActiveModels, SessionMetricsCollector
 from agent.prompts import ScriptConfig, build_system_prompt, load_script
+from agent.reporting import (
+    CallReporter,
+    extract_call_id,
+    extract_chat_message_text,
+)
 from agent.telephony import (
     extract_job_phone_number,
     mask_phone_number,
@@ -404,13 +411,14 @@ async def post_call_extraction_and_summary(
         state=state,
         extraction_result=extraction_res,
     )
+    if extraction_res.get("status") == "ok":
+        summary["status"] = "ok"
 
     try:
         save_call_summary(room_name, summary)
     except Exception as e:
         logger.warning("Failed to save call summary to logs/calls: %s", e)
 
-    metrics_collector.on_session_close()
     return summary
 
 
@@ -439,6 +447,11 @@ server = AgentServer(
 @server.rtc_session(agent_name=settings.agent_dispatch_name)
 async def entrypoint(ctx: JobContext) -> None:
     """RTC session entrypoint for voice callback agent."""
+    call_id = extract_call_id(getattr(ctx.job, "metadata", None))
+    reporter = CallReporter(call_id=call_id)
+    call_start_time: float | None = None
+    turn_counter = 0
+
     has_phone_key, raw_phone = extract_job_phone_number(
         getattr(ctx.job, "metadata", None)
     )
@@ -523,30 +536,107 @@ async def entrypoint(ctx: JobContext) -> None:
 
     agent = VoiceCallbackAgent(script)
 
-    summary_processed = False
+    session_finalized = False
 
-    async def _on_shutdown() -> None:
-        nonlocal summary_processed
-        if not summary_processed:
-            summary_processed = True
+    async def _finalize_session(status: str | None = None) -> None:
+        nonlocal session_finalized
+        if session_finalized:
+            return
+        session_finalized = True
+
+        if status:
+            call_status = status
+        elif call_start_time is not None:
+            call_status = "completed"
+        else:
+            call_status = "failed"
+
+        duration = int(time.time() - call_start_time) if call_start_time else 0
+        latencies = metrics_collector.on_session_close()
+
+        if call_start_time is not None:
+            ended_by = "agent" if session_state.call_ended else "user"
+            reporter.report_event(
+                "call_ended",
+                f"Call ended by {ended_by}",
+                {"ended_by": ended_by},
+            )
+
+        reporter.report_ended(
+            status=call_status,
+            duration_seconds=duration,
+            latency_summary=latencies,
+        )
+
+        if call_status == "completed":
             try:
-                await post_call_extraction_and_summary(
+                extraction_summary = await post_call_extraction_and_summary(
                     room_name=ctx.room.name,
                     history=session.history,
                     state=session_state,
                     metrics_collector=metrics_collector,
                     script=script,
                 )
+                status_val = (
+                    extraction_summary.get("status")
+                    if isinstance(extraction_summary, dict)
+                    else None
+                )
+                if status_val == "ok":
+                    reporter.report_extraction(
+                        extracted_answers=extraction_summary.get("answers", {}),
+                        extracted_missing=extraction_summary.get("missing", []),
+                        extraction_status="ok",
+                    )
+                else:
+                    reporter.report_extraction(
+                        extracted_answers={},
+                        extracted_missing=list(script.question_fields),
+                        extraction_status="extraction_failed",
+                    )
             except Exception as e:
                 logger.error(
                     "Error in post-call extraction: %s",
                     mask_phone_number(str(e)),
                 )
-            finally:
-                metrics_collector.on_session_close()
+                reporter.report_extraction(
+                    extracted_answers={},
+                    extracted_missing=list(script.question_fields),
+                    extraction_status="extraction_failed",
+                )
+
+        await reporter.aclose()
+
+    async def _on_shutdown() -> None:
+        await _finalize_session()
+
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(event: Any) -> None:
+        nonlocal turn_counter
+        item = getattr(event, "item", None)
+        if isinstance(item, llm.ChatMessage):
+            role_val = str(
+                item.role.value if hasattr(item.role, "value") else item.role
+            ).lower()
+            if role_val in ("user", "assistant", "agent"):
+                text = extract_chat_message_text(item)
+                if text:
+                    turn_counter += 1
+                    mapped_role = (
+                        "agent" if role_val in ("assistant", "agent") else "user"
+                    )
+                    reporter.report_turn(
+                        role=mapped_role,
+                        content=text,
+                        turn_index=turn_counter,
+                    )
 
     @session.on("error")
     def _on_error(event: ErrorEvent) -> None:
+        reporter.report_event(
+            "error",
+            mask_phone_number(str(getattr(event, "error", event))),
+        )
         err = getattr(event, "error", None)
         if isinstance(err, llm.LLMError):
             if not err.recoverable:
@@ -610,6 +700,11 @@ async def entrypoint(ctx: JobContext) -> None:
                 max_call_duration=Duration(seconds=600),
             )
             sip_info = await ctx.api.sip.create_sip_participant(sip_req)
+            call_start_time = time.time()
+            reporter.report_event(
+                "call_answered",
+                f"Call answered by {mask_phone_number(phone_number)}",
+            )
             logger.info(
                 "Call answered by %s (participant identity: %s)",
                 mask_phone_number(phone_number),
@@ -646,16 +741,46 @@ async def entrypoint(ctx: JobContext) -> None:
         # Browser mode (M1 behaviour)
         await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
         logger.info("Connected to room '%s', waiting for participant...", ctx.room.name)
+
+        if reporter.is_noop and ctx.room:
+            room_meta = getattr(ctx.room, "metadata", None)
+            room_call_id = extract_call_id(room_meta)
+            if room_call_id:
+                reporter.set_call_id(room_call_id)
+
         try:
-            participant = await ctx.wait_for_participant()
+            participant = await asyncio.wait_for(
+                ctx.wait_for_participant(),
+                timeout=settings.participant_join_timeout,
+            )
+        except TimeoutError:
+            logger.info(
+                "No participant joined room '%s' within %ss; closing as no_answer",
+                ctx.room.name,
+                settings.participant_join_timeout,
+            )
+            reporter.report_event(
+                "timeout",
+                f"No participant joined within {settings.participant_join_timeout}s",
+            )
+            await _finalize_session(status="no_answer")
+            await _cleanup_and_shutdown(
+                ctx, reason="participant join timeout", session=session
+            )
+            return
         except RuntimeError:
             logger.info("room closed before participant joined")
+            await _finalize_session(status="no_answer")
             return
 
-        logger.info(
-            "Participant joined: identity=%s, name=%s",
-            participant.identity,
-            participant.name,
+        call_start_time = time.time()
+        reporter.report_event(
+            "participant_joined",
+            (
+                f"Participant joined: identity={participant.identity}, "
+                f"name={participant.name}"
+            ),
+            {"identity": participant.identity, "name": participant.name},
         )
 
         await session.start(agent=agent, room=ctx.room)
