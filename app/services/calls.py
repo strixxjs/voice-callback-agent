@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.telephony import mask_phone_number
+from app.live import broadcaster
 from app.models import Call, CallEvent, CallTurn, Lead
 
 logger = logging.getLogger("app.services.calls")
@@ -33,7 +34,23 @@ def room_name_for_call(call_id: uuid.UUID) -> str:
 
 
 def _publish(kind: str, call: Call, data: dict[str, Any]) -> None:
-    """Post-commit hook for live updates. No-op until the SSE broadcaster lands."""
+    """Post-commit hook for live updates fanned out via SSE broadcaster."""
+    try:
+        event = {
+            "kind": kind,
+            "call_id": str(call.id),
+            "status": call.status,
+            "data": data,
+            "ts": datetime.now(UTC).isoformat(),
+        }
+        broadcaster.publish(event)
+    except Exception as exc:
+        logger.warning(
+            "Failed to publish live event kind=%s call_id=%s: %s",
+            kind,
+            call.id,
+            exc,
+        )
 
 
 async def create_lead_and_call(
