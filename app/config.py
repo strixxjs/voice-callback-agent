@@ -16,6 +16,7 @@ class Settings(BaseSettings):
         "postgresql+asyncpg://postgres:postgres@localhost:5432/voice_agent"
     )
     internal_api_secret: str = "change-me"
+    internal_api_url: str = "http://localhost:8000"
     public_base_url: str = "http://localhost:8000"
 
     # Call rules
@@ -24,6 +25,7 @@ class Settings(BaseSettings):
     call_hours_end: time = time(20, 0)
     retry_after_minutes: int = 15
     max_call_attempts: int = 2
+    participant_join_timeout: float = 60.0
 
     # LiveKit
     livekit_url: str = "wss://your-project.livekit.cloud"
