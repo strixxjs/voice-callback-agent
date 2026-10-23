@@ -466,7 +466,10 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.info("Session close event: reason=%s", event.reason)
         on_session_done()
 
-    ctx.add_shutdown_callback(on_session_done)
+    async def _on_shutdown() -> None:
+        on_session_done()
+
+    ctx.add_shutdown_callback(_on_shutdown)
 
     if phone_mode and phone_number is not None:
         trunk_id = settings.sip_outbound_trunk_id
