@@ -98,12 +98,150 @@ def terminate_call(
     return task
 
 
+def is_question_text(text: str | None) -> bool:
+    """Returns True if the text ends with a question mark.
+
+    Handles trailing whitespace, quotes, brackets, and secondary
+    punctuation (e.g. ?!, ?..).
+    """
+    if not text:
+        return False
+    cleaned = text.strip().rstrip(" \t\n\r\"'`»”’)]}")
+    cleaned = cleaned.rstrip(".!")
+    cleaned = cleaned.rstrip(" \t\n\r\"'`»”’)]}")
+    return cleaned.endswith("?")
+
+
+def _get_message_role(msg: Any) -> str:
+    """Extracts role in lowercase from a ChatMessage, dict, or object."""
+    if isinstance(msg, dict):
+        return str(msg.get("role", "")).lower()
+    role = getattr(msg, "role", None)
+    if role is None:
+        return ""
+    if hasattr(role, "value") and isinstance(role.value, str):
+        return role.value.lower()
+    if isinstance(role, str):
+        return role.lower()
+    return ""
+
+
+def _extract_message_text(msg: Any) -> str:
+    """Extracts plain text content from a ChatMessage, dict, or object."""
+    if msg is None:
+        return ""
+    if isinstance(msg, str):
+        return msg
+    if isinstance(msg, dict):
+        return str(msg.get("content") or msg.get("text") or "")
+    if hasattr(msg, "text_content") and isinstance(msg.text_content, str):
+        return msg.text_content
+    if hasattr(msg, "content"):
+        content = msg.content
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for p in content:
+                if isinstance(p, str):
+                    parts.append(p)
+                elif hasattr(p, "text") and isinstance(p.text, str):
+                    parts.append(p.text)
+            return " ".join(parts).strip()
+    return ""
+
+
+def _extract_history_messages(history: Any) -> list[Any]:
+    """Safely extracts message list from a ChatContext, list, or object."""
+    if history is None:
+        return []
+    if isinstance(history, (list, tuple)):
+        return list(history)
+    if hasattr(history, "messages"):
+        msgs = history.messages
+        if callable(msgs):
+            try:
+                res = msgs()
+                if isinstance(res, (list, tuple)):
+                    return list(res)
+            except Exception:
+                pass
+        elif isinstance(msgs, (list, tuple)):
+            return list(msgs)
+    if hasattr(history, "items"):
+        items = history.items
+        if callable(items):
+            try:
+                res = items()
+                if isinstance(res, (list, tuple)):
+                    return list(res)
+            except Exception:
+                pass
+        elif isinstance(items, (list, tuple)):
+            return list(items)
+    return []
+
+
+def _extract_speech_text(speech_handle: Any) -> str:
+    """Safely extracts spoken assistant text from SpeechHandle.chat_items."""
+    if speech_handle is None:
+        return ""
+    chat_items = getattr(speech_handle, "chat_items", None)
+    if not isinstance(chat_items, (list, tuple)):
+        return ""
+    texts: list[str] = []
+    for item in chat_items:
+        role = _get_message_role(item)
+        if role == "assistant":
+            t = _extract_message_text(item)
+            if t:
+                texts.append(t)
+    return " ".join(texts).strip()
+
+
+def has_pending_agent_question(
+    messages: list[Any] | None = None,
+    current_generation_text: str | None = None,
+) -> bool:
+    """Determines whether an agent question is pending without a user response.
+
+    Returns True if:
+    1. The agent's text in the current generation ends with a question.
+    2. OR the last agent message in history ends with a question and there was
+       no user message after it.
+    """
+    if current_generation_text and is_question_text(current_generation_text):
+        return True
+
+    if not messages:
+        return False
+
+    last_agent_idx: int | None = None
+    last_agent_text: str = ""
+    last_user_idx: int | None = None
+
+    for idx, item in enumerate(messages):
+        role = _get_message_role(item)
+        if role == "assistant":
+            last_agent_idx = idx
+            last_agent_text = _extract_message_text(item)
+        elif role == "user":
+            last_user_idx = idx
+
+    if last_agent_idx is not None and is_question_text(last_agent_text):
+        if last_user_idx is None or last_user_idx < last_agent_idx:
+            return True
+
+    return False
+
+
 @function_tool
 async def end_call(context: RunContext) -> None:
     """Terminates call session when questions are done or caller wishes to finish.
 
-    Call this tool when all questions have been asked/answered or when the user
-    wants to finish the call. This tool speaks the goodbye phrase itself, so do
+    Call this tool ONLY AFTER the user has answered the last question or
+    wants to finish the call. NEVER call this tool in the same response as
+    asking a question. This tool speaks the goodbye phrase itself, so do
     NOT say goodbye or speak a farewell in your own reply.
 
     Raises:
@@ -127,6 +265,17 @@ async def end_call(context: RunContext) -> None:
     # Re-check user state in case caller spoke during playout
     if session.user_state == "speaking":
         logger.info("User began speaking during speech playout; aborting termination.")
+        return None
+
+    # Guard: do not end call if agent just asked a question awaiting user's answer
+    current_text = _extract_speech_text(getattr(context, "speech_handle", None))
+    history_messages = _extract_history_messages(getattr(session, "history", None))
+
+    if has_pending_agent_question(
+        messages=history_messages,
+        current_generation_text=current_text,
+    ):
+        logger.warning("end_call rejected: pending question")
         return None
 
     logger.info("end_call tool triggered, closing call session.")
