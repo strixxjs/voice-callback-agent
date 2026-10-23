@@ -291,3 +291,62 @@ def test_metrics_collector_never_breaks_call(tmp_path: Path) -> None:
         summary = collector.on_session_close()
         assert summary["turns"] == 0
         assert summary["avg"] == 0.0
+
+
+def test_session_metrics_collector_split_user_turn(tmp_path: Path) -> None:
+    """Verifies that split user utterances preserve earlier non-empty metrics."""
+    collector = SessionMetricsCollector(
+        room_name="test-room-split",
+        models=_create_test_models(),
+        log_dir=tmp_path,
+    )
+
+    # 1. First part of split user utterance (has metrics from STT)
+    user_msg_1 = llm.ChatMessage(
+        role="user",
+        content=["Приблизно знов впродовж трьох."],
+    )
+    user_msg_1.metrics = {
+        "end_of_turn_delay": 0.794,
+        "transcription_delay": 0.792,
+        "speech_start_time": 1792747960.51,
+    }
+    collector._on_conversation_item_added(ConversationItemAddedEvent(item=user_msg_1))
+
+    # 2. Second part of split user utterance (STT split, metrics empty or None values)
+    user_msg_2 = llm.ChatMessage(
+        role="user",
+        content=["Днів."],
+    )
+    user_msg_2.metrics = {
+        "speech_start_time": None,
+        "end_of_turn_delay": None,
+    }
+    collector._on_conversation_item_added(ConversationItemAddedEvent(item=user_msg_2))
+
+    # 3. Assistant response
+    assistant_msg = llm.ChatMessage(
+        role="assistant",
+        content=["Чудово. О котрій годині зателефонувати?"],
+    )
+    assistant_msg.metrics = {
+        "llm_node_ttft": 0.427,
+        "tts_node_ttfb": 0.214,
+        "e2e_latency": 2.191,
+    }
+    collector._on_conversation_item_added(ConversationItemAddedEvent(item=assistant_msg))
+
+    assert collector.turn_index == 1
+    assert collector.turn_latencies == [2.191]
+
+    # Verify JSONL content preserved user_msg_1 metrics
+    jsonl_file = tmp_path / "test-room-split.jsonl"
+    record = json.loads(jsonl_file.read_text(encoding="utf-8").strip())
+    assert record["turn_index"] == 1
+    assert record["end_of_utterance_delay"] == 0.794
+    assert record["stt_duration"] == 0.792
+    assert record["llm_ttft"] == 0.427
+    assert record["tts_ttfb"] == 0.214
+    assert record["total_response_latency"] == 2.191
+    assert record["e2e_source"] == "sdk"
+

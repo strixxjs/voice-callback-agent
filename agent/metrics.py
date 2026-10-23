@@ -116,13 +116,19 @@ class SessionMetricsCollector:
 
             if item.role == "user":
                 raw_metrics = getattr(item, "metrics", {}) or {}
-                self._last_user_metrics = dict(raw_metrics)
+                if self._last_user_metrics is None:
+                    self._last_user_metrics = {}
+                for k, v in raw_metrics.items():
+                    if v is not None and v != "":
+                        current_val = self._last_user_metrics.get(k)
+                        if current_val is None or current_val == "":
+                            self._last_user_metrics[k] = v
             elif item.role == "assistant":
                 user_metrics = self._last_user_metrics
                 self._last_user_metrics = None
 
                 # Skip assistant messages not answering user speech (e.g. greeting)
-                if not user_metrics:
+                if user_metrics is None:
                     return
 
                 raw_assistant_metrics = getattr(item, "metrics", {}) or {}
