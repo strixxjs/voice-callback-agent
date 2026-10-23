@@ -51,10 +51,14 @@ class Settings(BaseSettings):
     tts_voice_id: str | None = None
     elevenlabs_api_key: str | None = None
 
-    # Turn detection: "vad" (local Silero, free) or "turn_detector" (cloud inference)
+    # Turn detection & Endpointing
+    # "vad" (local Silero, free) or "turn_detector" (cloud inference)
     turn_detection_mode: str = "vad"
-    # Interruption mode: "vad" (local Silero, free) or "adaptive" (cloud inference)
+    # "vad" (local Silero, free) or "adaptive" (cloud inference)
     interruption_mode: str = "vad"
+    endpointing_min_delay: float = 0.5
+    endpointing_max_delay: float = 3.0
+    preemptive_generation: bool = True
 
     # Delivery
     telegram_bot_token: str | None = None

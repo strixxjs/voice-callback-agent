@@ -28,6 +28,7 @@ from livekit.agents import (
 from livekit.agents.voice.agent_session import SessionConnectOptions
 from livekit.agents.voice.room_io import RoomOptions
 
+from agent.metrics import ActiveModels, SessionMetricsCollector
 from agent.prompts import ScriptConfig, build_system_prompt, load_script
 from agent.telephony import (
     extract_job_phone_number,
@@ -86,18 +87,105 @@ def _create_llm_instance(provider: str, model: str) -> Any:
         raise ValueError(f"Unsupported LLM provider: {provider}")
 
 
+DEFAULT_ELEVENLABS_VOICE_ID = "hpp4J3VqNfWAUOO0d1Us"
+
+PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
+    "llm": {
+        "google": "gemini-3.5-flash-lite",
+        "openai": "gpt-4o-mini",
+    },
+    "stt": {
+        "deepgram": "nova-3",
+        "openai": "whisper-1",
+    },
+    "tts_model": {
+        "elevenlabs": "eleven_turbo_v2_5",
+        "openai": "tts-1",
+    },
+    "tts_voice": {
+        "elevenlabs": DEFAULT_ELEVENLABS_VOICE_ID,
+        "openai": "alloy",
+    },
+}
+
+
+def resolve_llm_model(provider: str | None = None, model: str | None = None) -> str:
+    """Resolve active LLM model name from explicit config or provider default."""
+    if model:
+        return model
+    prov = (provider or settings.llm_provider).lower()
+    return PROVIDER_DEFAULTS["llm"].get(prov, "gemini-3.5-flash-lite")
+
+
+def resolve_stt_model(provider: str | None = None, model: str | None = None) -> str:
+    """Resolve active STT model name from explicit config or provider default."""
+    if model:
+        return model
+    prov = (provider or settings.stt_provider).lower()
+    return PROVIDER_DEFAULTS["stt"].get(prov, "nova-3")
+
+
+def resolve_tts_model(provider: str | None = None, model: str | None = None) -> str:
+    """Resolve active TTS model name from explicit config or provider default."""
+    if model:
+        return model
+    prov = (provider or settings.tts_provider).lower()
+    return PROVIDER_DEFAULTS["tts_model"].get(prov, "eleven_turbo_v2_5")
+
+
+def resolve_tts_voice(provider: str | None = None, voice_id: str | None = None) -> str:
+    """Resolve active TTS voice ID from explicit config or provider default."""
+    if voice_id:
+        return voice_id
+    prov = (provider or settings.tts_provider).lower()
+    return PROVIDER_DEFAULTS["tts_voice"].get(prov, DEFAULT_ELEVENLABS_VOICE_ID)
+
+
+def _sync_google_thought_signatures(primary_llm: Any, fallback_llm: Any) -> None:
+    """Share thought signatures dictionary between Google LLM instances.
+
+    Why:
+        Gemini 2.5+ and 3+ models require thought signatures on function call parts
+        in multi-turn history (Google API rejects missing signatures with HTTP 400).
+        In livekit-plugins-google (livekit/plugins/google/llm.py:318, 574, 881),
+        thought signatures are stored in `self._thought_signatures: dict[str, bytes]`.
+        When FallbackAdapter switches to fallback_llm, fallback_llm starts with an
+        empty dict and fails with HTTP 400 on any turn following previous tool calls.
+        Sharing the dictionary object ensures the fallback retains all thought
+        signatures from earlier turns.
+
+    Warning:
+        Relies on private attribute `_thought_signatures` in
+        livekit.plugins.google.llm.LLM. Must be rechecked on plugin upgrades.
+    """
+    if not hasattr(primary_llm, "_thought_signatures") or not hasattr(
+        fallback_llm, "_thought_signatures"
+    ):
+        logger.warning(
+            "Cannot sync Google thought signatures: '_thought_signatures' attribute "
+            "missing on primary (%s) or fallback (%s) LLM. "
+            "Check livekit-plugins-google.",
+            type(primary_llm).__name__,
+            type(fallback_llm).__name__,
+        )
+        return
+
+    fallback_llm._thought_signatures = primary_llm._thought_signatures
+
+
 def get_llm() -> Any:
     """Lazily instantiate configured LLM, optionally wrapped in FallbackAdapter."""
     provider = settings.llm_provider.lower()
-    primary_model = settings.llm_model or (
-        "gemini-3.5-flash-lite" if provider == "google" else "gpt-4o-mini"
-    )
+    primary_model = resolve_llm_model(provider, settings.llm_model)
     primary_llm = _create_llm_instance(provider, primary_model)
 
     if settings.llm_fallback_model:
         from livekit.agents.llm import FallbackAdapter
 
         fallback_llm = _create_llm_instance(provider, settings.llm_fallback_model)
+        if provider == "google":
+            _sync_google_thought_signatures(primary_llm, fallback_llm)
+
         logger.info(
             "Configuring LLM with FallbackAdapter: primary=%s, fallback=%s",
             primary_model,
@@ -118,13 +206,15 @@ def get_llm() -> Any:
 def get_stt(language: str) -> Any:
     """Lazily instantiate the configured STT provider."""
     provider = settings.stt_provider.lower()
+    model = resolve_stt_model(provider, settings.stt_model)
     if provider == "deepgram":
         from livekit.plugins import deepgram
 
         api_key = settings.deepgram_api_key or os.environ.get("DEEPGRAM_API_KEY")
-        kwargs: dict[str, Any] = {"language": language}
-        if settings.stt_model:
-            kwargs["model"] = settings.stt_model
+        kwargs: dict[str, Any] = {
+            "language": language,
+            "model": model,
+        }
         if api_key:
             kwargs["api_key"] = api_key
         return deepgram.STT(**kwargs)
@@ -132,9 +222,10 @@ def get_stt(language: str) -> Any:
         from livekit.plugins import openai
 
         api_key = settings.openai_api_key or os.environ.get("OPENAI_API_KEY")
-        kwargs = {"language": language}
-        if settings.stt_model:
-            kwargs["model"] = settings.stt_model
+        kwargs = {
+            "language": language,
+            "model": model,
+        }
         if api_key:
             kwargs["api_key"] = api_key
         return openai.STT(**kwargs)
@@ -145,6 +236,8 @@ def get_stt(language: str) -> Any:
 def get_tts() -> Any:
     """Lazily instantiate the configured TTS provider."""
     provider = settings.tts_provider.lower()
+    model = resolve_tts_model(provider, settings.tts_model)
+    voice = resolve_tts_voice(provider, settings.tts_voice_id)
     if provider == "elevenlabs":
         from livekit.plugins import elevenlabs
 
@@ -153,11 +246,10 @@ def get_tts() -> Any:
             or os.environ.get("ELEVENLABS_API_KEY")
             or os.environ.get("ELEVEN_API_KEY")
         )
-        kwargs: dict[str, Any] = {}
-        if settings.tts_model:
-            kwargs["model"] = settings.tts_model
-        if settings.tts_voice_id:
-            kwargs["voice_id"] = settings.tts_voice_id
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "voice_id": voice,
+        }
         if api_key:
             kwargs["api_key"] = api_key
         return elevenlabs.TTS(**kwargs)
@@ -165,11 +257,10 @@ def get_tts() -> Any:
         from livekit.plugins import openai
 
         api_key = settings.openai_api_key or os.environ.get("OPENAI_API_KEY")
-        kwargs = {}
-        if settings.tts_model:
-            kwargs["model"] = settings.tts_model
-        if settings.tts_voice_id:
-            kwargs["voice"] = settings.tts_voice_id
+        kwargs = {
+            "model": model,
+            "voice": voice,
+        }
         if api_key:
             kwargs["api_key"] = api_key
         return openai.TTS(**kwargs)
@@ -187,7 +278,7 @@ def get_vad(ctx: JobContext | None = None) -> Any:
 
 
 def get_turn_handling() -> TurnHandlingOptions:
-    """Configure turn handling and interruption options."""
+    """Configure turn handling, endpointing, and interruption options."""
     mode = settings.turn_detection_mode.lower()
     if mode == "turn_detector":
         from livekit.agents.inference import TurnDetector
@@ -201,6 +292,13 @@ def get_turn_handling() -> TurnHandlingOptions:
     return TurnHandlingOptions(
         turn_detection=turn_detector,
         interruption={"enabled": True, "mode": interruption_mode},
+        endpointing={
+            "min_delay": settings.endpointing_min_delay,
+            "max_delay": settings.endpointing_max_delay,
+        },
+        preemptive_generation={
+            "enabled": settings.preemptive_generation,
+        },
     )
 
 
@@ -350,6 +448,22 @@ async def entrypoint(ctx: JobContext) -> None:
         userdata=session_state,
     )
 
+    # Note: llm_model records the primary model; fallback-LLM switches are not tracked
+    active_models = ActiveModels(
+        llm_provider=settings.llm_provider,
+        llm_model=resolve_llm_model(settings.llm_provider, settings.llm_model),
+        stt_provider=settings.stt_provider,
+        stt_model=resolve_stt_model(settings.stt_provider, settings.stt_model),
+        tts_provider=settings.tts_provider,
+        tts_model=resolve_tts_model(settings.tts_provider, settings.tts_model),
+        tts_voice_id=resolve_tts_voice(settings.tts_provider, settings.tts_voice_id),
+    )
+    metrics_collector = SessionMetricsCollector(
+        room_name=ctx.room.name,
+        models=active_models,
+    )
+    metrics_collector.attach_to_session(session)
+
     agent = VoiceCallbackAgent(script)
 
     summary_logged = False
@@ -358,7 +472,10 @@ async def entrypoint(ctx: JobContext) -> None:
         nonlocal summary_logged
         if not summary_logged:
             summary_logged = True
-            log_session_summary(ctx.room.name, session.history, session_state)
+            try:
+                log_session_summary(ctx.room.name, session.history, session_state)
+            finally:
+                metrics_collector.on_session_close()
 
     @session.on("error")
     def _on_error(event: ErrorEvent) -> None:
@@ -384,7 +501,10 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.info("Session close event: reason=%s", event.reason)
         on_session_done()
 
-    ctx.add_shutdown_callback(on_session_done)
+    async def _on_shutdown() -> None:
+        on_session_done()
+
+    ctx.add_shutdown_callback(_on_shutdown)
 
     if phone_mode and phone_number is not None:
         trunk_id = settings.sip_outbound_trunk_id

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -294,3 +296,91 @@ def test_get_llm_fallback_adapter_wrapping(monkeypatch: pytest.MonkeyPatch) -> N
     assert llm_instance._retry_on_chunk_sent is False
     assert llm_instance._max_retry_per_llm == 0
     assert llm_instance._retry_interval == 0.5
+
+
+def test_get_llm_google_shares_thought_signatures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies that primary and fallback Google LLMs share _thought_signatures."""
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
+    monkeypatch.setattr(settings, "llm_provider", "google")
+    monkeypatch.setattr(settings, "llm_model", "gemini-3.5-flash-lite")
+    monkeypatch.setattr(settings, "llm_fallback_model", "gemini-3.5-flash")
+
+    llm_instance = get_llm()
+    primary, fallback = llm_instance._llm_instances
+
+    # 1. Both instances must share the exact same dictionary object
+    assert hasattr(primary, "_thought_signatures")
+    assert hasattr(fallback, "_thought_signatures")
+    assert primary._thought_signatures is fallback._thought_signatures
+
+    # 2. A signature written through primary must be visible through fallback
+    primary._thought_signatures["test_call_id"] = b"sig_bytes"
+    assert fallback._thought_signatures["test_call_id"] == b"sig_bytes"
+
+
+def test_sync_google_thought_signatures_missing_attribute(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies that missing _thought_signatures logs a warning and does not crash."""
+    from agent.worker import _sync_google_thought_signatures
+
+    class DummyLLM:
+        pass
+
+    primary = DummyLLM()
+    fallback = DummyLLM()
+
+    # Must not raise an exception
+    with caplog.at_level("WARNING"):
+        _sync_google_thought_signatures(primary, fallback)
+
+    assert "Cannot sync Google thought signatures" in caplog.text
+    assert "attribute missing" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_entrypoint_registers_async_shutdown_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies that entrypoint registers an async shutdown callback.
+
+    In LiveKit job runner, zero-argument callbacks are wrapped with:
+        async def wrapper(_: str) -> None:
+            await callback()
+    A synchronous callback returns None, triggering TypeError:
+    object NoneType can't be used in 'await' expression.
+    The callback must be a coroutine function.
+    """
+    from agent.worker import entrypoint
+
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
+    monkeypatch.setattr(settings, "deepgram_api_key", "test-key")
+    monkeypatch.setattr(settings, "elevenlabs_api_key", "test-key")
+
+    mock_ctx = MagicMock()
+    mock_ctx.room.name = "test-room"
+    mock_ctx.job.metadata = None
+    mock_ctx.connect = AsyncMock()
+    # Cancel at wait_for_participant to halt entrypoint after session setup
+    mock_ctx.wait_for_participant = AsyncMock(side_effect=asyncio.CancelledError)
+
+    with pytest.raises(asyncio.CancelledError):
+        await entrypoint(mock_ctx)
+
+    mock_ctx.add_shutdown_callback.assert_called_once()
+    registered_cb = mock_ctx.add_shutdown_callback.call_args[0][0]
+
+    # Must be a coroutine function
+    assert inspect.iscoroutinefunction(registered_cb)
+
+    # Calling and awaiting must succeed without TypeError
+    result = await registered_cb()
+    assert result is None
+
+    # Simulating LiveKit's job.py:637 wrapper must also succeed
+    async def lk_wrapper(_: str) -> None:
+        await registered_cb()
+
+    await lk_wrapper("room disconnected")
