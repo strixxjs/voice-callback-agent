@@ -28,6 +28,11 @@ from livekit.agents import (
 from livekit.agents.voice.agent_session import SessionConnectOptions
 from livekit.agents.voice.room_io import RoomOptions
 
+from agent.extraction import (
+    build_transcript_text,
+    extract_answers,
+    save_call_summary,
+)
 from agent.metrics import ActiveModels, SessionMetricsCollector
 from agent.prompts import ScriptConfig, build_system_prompt, load_script
 from agent.telephony import (
@@ -35,7 +40,7 @@ from agent.telephony import (
     mask_phone_number,
     validate_e164,
 )
-from agent.tools import SessionState, end_call, save_answer, terminate_call
+from agent.tools import SessionState, end_call, terminate_call
 from app.config import settings
 
 logger = logging.getLogger("agent.worker")
@@ -309,7 +314,7 @@ class VoiceCallbackAgent(Agent):
         instructions = build_system_prompt(script)
         super().__init__(
             instructions=instructions,
-            tools=[save_answer, end_call],
+            tools=[end_call],
         )
 
 
@@ -343,18 +348,69 @@ def log_session_summary(
     room_name: str,
     history: llm.ChatContext,
     state: SessionState,
+    *,
+    extraction_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Logs the final call transcript and collected answers as JSON."""
     transcript = extract_transcript(history)
     summary: dict[str, Any] = {
         "room": room_name,
-        "answers": state.answers,
         "transcript": transcript,
     }
+
+    if extraction_result and extraction_result.get("status") == "extraction_failed":
+        summary["status"] = "extraction_failed"
+        summary["error"] = extraction_result.get("error", "Unknown extraction error")
+        summary["answers"] = state.answers
+        summary["missing"] = extraction_result.get("missing", [])
+    elif extraction_result:
+        summary["answers"] = extraction_result.get("answers", state.answers)
+        summary["missing"] = extraction_result.get("missing", [])
+    else:
+        summary["answers"] = state.answers
+
     logger.info(
         "Call session ended. Summary:\n%s",
         json.dumps(summary, ensure_ascii=False, indent=2),
     )
+    return summary
+
+
+async def post_call_extraction_and_summary(
+    room_name: str,
+    history: llm.ChatContext,
+    state: SessionState,
+    metrics_collector: SessionMetricsCollector,
+    script: ScriptConfig,
+) -> dict[str, Any]:
+    """Post-call extraction from transcript, writes call log, and metrics."""
+    transcript_text = build_transcript_text(history)
+    question_keys = script.question_fields
+
+    extraction_res = await extract_answers(
+        transcript=transcript_text,
+        question_keys=question_keys,
+        model=settings.extraction_model,
+    )
+
+    if extraction_res.get("status") == "ok":
+        state.answers = extraction_res.get("answers", {})
+    else:
+        state.answers = dict.fromkeys(question_keys)
+
+    summary = log_session_summary(
+        room_name=room_name,
+        history=history,
+        state=state,
+        extraction_result=extraction_res,
+    )
+
+    try:
+        save_call_summary(room_name, summary)
+    except Exception as e:
+        logger.warning("Failed to save call summary to logs/calls: %s", e)
+
+    metrics_collector.on_session_close()
     return summary
 
 
@@ -376,6 +432,7 @@ server = AgentServer(
     api_key=settings.livekit_api_key,
     api_secret=settings.livekit_api_secret,
     setup_fnc=prewarm,
+    shutdown_process_timeout=30.0,
 )
 
 
@@ -466,14 +523,25 @@ async def entrypoint(ctx: JobContext) -> None:
 
     agent = VoiceCallbackAgent(script)
 
-    summary_logged = False
+    summary_processed = False
 
-    def on_session_done() -> None:
-        nonlocal summary_logged
-        if not summary_logged:
-            summary_logged = True
+    async def _on_shutdown() -> None:
+        nonlocal summary_processed
+        if not summary_processed:
+            summary_processed = True
             try:
-                log_session_summary(ctx.room.name, session.history, session_state)
+                await post_call_extraction_and_summary(
+                    room_name=ctx.room.name,
+                    history=session.history,
+                    state=session_state,
+                    metrics_collector=metrics_collector,
+                    script=script,
+                )
+            except Exception as e:
+                logger.error(
+                    "Error in post-call extraction: %s",
+                    mask_phone_number(str(e)),
+                )
             finally:
                 metrics_collector.on_session_close()
 
@@ -499,10 +567,6 @@ async def entrypoint(ctx: JobContext) -> None:
     @session.on("close")
     def _on_close(event: CloseEvent) -> None:
         logger.info("Session close event: reason=%s", event.reason)
-        on_session_done()
-
-    async def _on_shutdown() -> None:
-        on_session_done()
 
     ctx.add_shutdown_callback(_on_shutdown)
 
@@ -582,7 +646,12 @@ async def entrypoint(ctx: JobContext) -> None:
         # Browser mode (M1 behaviour)
         await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
         logger.info("Connected to room '%s', waiting for participant...", ctx.room.name)
-        participant = await ctx.wait_for_participant()
+        try:
+            participant = await ctx.wait_for_participant()
+        except RuntimeError:
+            logger.info("room closed before participant joined")
+            return
+
         logger.info(
             "Participant joined: identity=%s, name=%s",
             participant.identity,
