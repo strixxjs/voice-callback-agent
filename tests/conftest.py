@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+import agent.extraction
 import agent.worker
 import app.config
 import tests.test_agent
@@ -16,6 +17,7 @@ def isolate_env(monkeypatch: pytest.MonkeyPatch) -> Settings:
     clean_settings = Settings(_env_file=None)
     monkeypatch.setattr(app.config, "settings", clean_settings)
     monkeypatch.setattr(agent.worker, "settings", clean_settings)
+    monkeypatch.setattr(agent.extraction, "settings", clean_settings)
     monkeypatch.setattr(tests.test_agent, "settings", clean_settings)
     try:
         import scripts.call_me
