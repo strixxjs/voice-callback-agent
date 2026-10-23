@@ -15,8 +15,11 @@ from sqlalchemy.ext.asyncio import (
 import agent.extraction
 import agent.reporting
 import agent.worker
+import app.api.calls
 import app.api.internal
+import app.api.leads
 import app.config
+import app.livekit_rooms
 import tests.test_agent
 from app.config import Settings
 from app.db import get_db
@@ -33,6 +36,9 @@ def isolate_env(monkeypatch: pytest.MonkeyPatch) -> Settings:
     monkeypatch.setattr(agent.extraction, "settings", clean_settings)
     monkeypatch.setattr(agent.reporting, "settings", clean_settings)
     monkeypatch.setattr(app.api.internal, "settings", clean_settings)
+    monkeypatch.setattr(app.api.leads, "settings", clean_settings)
+    monkeypatch.setattr(app.api.calls, "settings", clean_settings)
+    monkeypatch.setattr(app.livekit_rooms, "settings", clean_settings)
     monkeypatch.setattr(tests.test_agent, "settings", clean_settings)
     try:
         import scripts.call_me

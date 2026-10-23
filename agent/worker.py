@@ -435,6 +435,23 @@ async def _cleanup_and_shutdown(
     ctx.shutdown(reason=reason)
 
 
+_close_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _schedule_close_shutdown(ctx: JobContext, reason: Any) -> asyncio.Task[None]:
+    """Schedules background room deletion and job shutdown after session close."""
+
+    async def _task() -> None:
+        with contextlib.suppress(Exception):
+            await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
+        ctx.shutdown(reason=f"session closed: {reason}")
+
+    task = asyncio.create_task(_task(), name="session_close_shutdown")
+    _close_tasks.add(task)
+    task.add_done_callback(_close_tasks.discard)
+    return task
+
+
 server = AgentServer(
     ws_url=settings.livekit_url,
     api_key=settings.livekit_api_key,
@@ -657,6 +674,7 @@ async def entrypoint(ctx: JobContext) -> None:
     @session.on("close")
     def _on_close(event: CloseEvent) -> None:
         logger.info("Session close event: reason=%s", event.reason)
+        _schedule_close_shutdown(ctx, event.reason)
 
     ctx.add_shutdown_callback(_on_shutdown)
 
@@ -783,7 +801,10 @@ async def entrypoint(ctx: JobContext) -> None:
             {"identity": participant.identity, "name": participant.name},
         )
 
-        await session.start(agent=agent, room=ctx.room)
+        room_options = RoomOptions(
+            delete_room_on_close=True,
+        )
+        await session.start(agent=agent, room=ctx.room, room_options=room_options)
 
         logger.info("Agent greeting participant with: '%s'", script.greeting)
         await session.say(script.greeting, allow_interruptions=False)

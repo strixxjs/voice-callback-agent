@@ -166,7 +166,29 @@ The worker registers itself with LiveKit Cloud and waits for incoming room conne
 6. Interruptions are enabled: speak while the agent is talking to test interruption handling and turn detection.
 7. When the call ends, inspect the worker console log for the structured JSON session summary containing the full transcript and collected answers.
 
-### 6. Run Tests and Linting
+### 6. Lead intake & calls API (M4)
+
+`POST /leads` creates a lead + call, a LiveKit room `call-<call_id>` (metadata `{"call_id","lead_id","mode"}` — never the phone) and a 1 h join-only token for that room. If `AGENT_DISPATCH_NAME` is set, the agent is dispatched explicitly; if empty, the worker auto-joins the room. Only `mode: "browser"` is enabled; `"phone"` returns `400` until Phone go-live. LiveKit errors return `502` and the call is marked `failed`.
+
+```bash
+curl -s -X POST http://localhost:8000/leads \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "Jane Doe", "phone": "+48123456789", "mode": "browser"}'
+# 201 {"lead_id": "...", "call_id": "...", "room": "call-...", "mode": "browser",
+#      "status": "dialing", "livekit_url": "wss://...", "token": "<jwt>"}
+```
+
+Join the room from the browser with `livekit_url` + `token` (e.g. [meet.livekit.io](https://meet.livekit.io) → Custom).
+
+Read-only demo endpoints (no auth, local demo only; phone numbers are always masked):
+
+```bash
+curl -s 'http://localhost:8000/api/calls?limit=20'   # newest first, limit 1..200 (default 50)
+curl -s http://localhost:8000/api/calls/<call_id>    # header + transcript + events + extraction
+curl -s http://localhost:8000/api/overview           # milestone stages + component config status
+```
+
+### 7. Run Tests and Linting
 
 Run test suite:
 
