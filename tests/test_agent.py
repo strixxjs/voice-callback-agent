@@ -4,15 +4,30 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from livekit.agents import StopResponse, llm
 
+from agent.extraction import (
+    build_transcript_text,
+    extract_answers,
+    format_short_error,
+    save_call_summary,
+)
 from agent.prompts import QuestionItem, ScriptConfig, build_system_prompt, load_script
-from agent.tools import SessionState, end_call, save_answer_to_state, terminate_call
-from agent.worker import extract_transcript, get_llm, log_session_summary
+from agent.telephony import mask_phone_number
+from agent.tools import SessionState, end_call, terminate_call
+from agent.worker import (
+    VoiceCallbackAgent,
+    extract_transcript,
+    get_llm,
+    log_session_summary,
+    post_call_extraction_and_summary,
+)
 from app.config import settings
 
 
@@ -21,16 +36,17 @@ def test_load_default_script() -> None:
     script = load_script()
 
     assert script.company_name == "Solaris Tech"
-    assert script.agent_name == "Анна"
+    assert script.agent_name == "Саня"
     assert script.language == "uk"
-    assert "записуватися" in script.greeting.lower()
     assert "асистентка" in script.greeting.lower()
+    assert "solaris tech" in script.greeting.lower()
     assert len(script.closing_phrase) > 0
     assert "помилка" in script.error_phrase.lower()
     assert "менеджер" in script.error_phrase.lower()
 
     fields = [q.field for q in script.questions]
     assert fields == ["name", "service", "timeline", "preferred_call_time"]
+    assert script.question_fields == fields
 
     required_map = {q.field: q.required for q in script.questions}
     assert required_map["name"] is True
@@ -123,9 +139,10 @@ def test_build_system_prompt_rules() -> None:
     assert "not interested" in prompt.lower()
 
     # Flow & questions
-    assert "Field 'name'" in prompt
-    assert "Field 'budget'" in prompt
-    assert "Dziękuję i do usłyszenia!" in prompt
+    assert "Question 'name'" in prompt
+    assert "Question 'budget'" in prompt
+    assert "end_call" in prompt
+    assert "farewell" in prompt.lower()
 
 
 def test_build_system_prompt_language_switch() -> None:
@@ -153,53 +170,150 @@ def test_build_system_prompt_language_switch() -> None:
     assert "English (en)" in en_prompt
 
 
-def test_session_state_and_save_answer() -> None:
-    """Tests storing answers in SessionState."""
+def test_save_answer_not_in_tools_and_end_call_is() -> None:
+    """Verifies save_answer is removed from agent tools and end_call is present."""
+    import agent.tools
+
+    assert not hasattr(agent.tools, "save_answer")
+    assert not hasattr(agent.tools, "save_answer_to_state")
+
+    script = load_script()
+    agent_instance = VoiceCallbackAgent(script)
+    tool_names = [getattr(t, "__name__", str(t)) for t in agent_instance.tools]
+
+    assert "end_call" in tool_names
+    assert "save_answer" not in tool_names
+
+
+def test_session_state_initialization() -> None:
+    """Tests initializing SessionState without save_answer."""
     state = SessionState(closing_phrase="Pa!")
     assert state.answers == {}
     assert state.call_ended is False
     assert len(state.background_tasks) == 0
 
-    save_answer_to_state(state, "name", "Jan Kowalski")
-    save_answer_to_state(state, "service", "Instalacja paneli PV")
 
-    assert state.answers["name"] == "Jan Kowalski"
-    assert state.answers["service"] == "Instalacja paneli PV"
+@pytest.mark.asyncio
+async def test_end_call_waits_for_playout_and_disconnects() -> None:
+    """Verifies end_call speaks closing phrase, waits playout, and terminates."""
+    closing = "Дякую за розмову! До побачення!"
+    state = SessionState(closing_phrase=closing)
+
+    mock_handle = MagicMock()
+    mock_handle.wait_for_playout = AsyncMock()
+
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.say = MagicMock(return_value=mock_handle)
+    mock_session.aclose = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.userdata = state
+    mock_context.session = mock_session
+    mock_context.wait_for_playout = AsyncMock()
+
+    with pytest.raises(StopResponse):
+        await end_call(mock_context)
+
+    assert state.call_ended is True
+    mock_context.wait_for_playout.assert_awaited_once()
+    assert len(state.background_tasks) == 1
+
+    for task in list(state.background_tasks):
+        await task
+
+    # Closing phrase was passed to terminate_call -> spoken via session.say
+    mock_session.say.assert_called_once_with(closing, allow_interruptions=False)
+    mock_handle.wait_for_playout.assert_awaited_once()
+    mock_session.aclose.assert_awaited_once()
+    assert len(state.background_tasks) == 0
 
 
 @pytest.mark.asyncio
-async def test_end_call_raises_stop_response_and_retains_task() -> None:
-    """Verifies end_call raises StopResponse and tracks background task."""
-    state = SessionState(closing_phrase="Do usłyszenia!")
-
-    mock_speech_handle = MagicMock()
-    mock_speech_handle.wait_for_playout = AsyncMock()
+async def test_end_call_does_not_close_when_user_speaking() -> None:
+    """Verifies end_call aborts and returns None if caller is currently speaking."""
+    state = SessionState(closing_phrase="До побачення!")
 
     mock_session = MagicMock()
-    mock_session.say.return_value = mock_speech_handle
+    mock_session.user_state = "speaking"
+    mock_session.say = MagicMock()
+    mock_session.aclose = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.userdata = state
+    mock_context.session = mock_session
+    mock_context.wait_for_playout = AsyncMock()
+
+    # Must return None and NOT raise StopResponse
+    result = await end_call(mock_context)
+    assert result is None
+
+    assert state.call_ended is False
+    assert len(state.background_tasks) == 0
+    mock_context.wait_for_playout.assert_not_called()
+    mock_session.say.assert_not_called()
+    mock_session.aclose.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_end_call_does_not_close_if_user_starts_speaking_during_playout() -> None:
+    """Verifies end_call aborts if user starts speaking while waiting for playout."""
+    state = SessionState(closing_phrase="До побачення!")
+
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.say = MagicMock()
     mock_session.aclose = AsyncMock()
 
     mock_context = MagicMock()
     mock_context.userdata = state
     mock_context.session = mock_session
 
+    async def simulate_user_starts_speaking() -> None:
+        mock_session.user_state = "speaking"
+
+    mock_context.wait_for_playout = AsyncMock(side_effect=simulate_user_starts_speaking)
+
+    result = await end_call(mock_context)
+    assert result is None
+
+    assert state.call_ended is False
+    assert len(state.background_tasks) == 0
+    mock_session.say.assert_not_called()
+    mock_session.aclose.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_end_call_logs_warning_on_playout_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verifies playout error is logged at warning level and call still terminates."""
+    closing = "До побачення!"
+    state = SessionState(closing_phrase=closing)
+
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.say = MagicMock(return_value=None)
+    mock_session.aclose = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.userdata = state
+    mock_context.session = mock_session
+    mock_context.wait_for_playout = AsyncMock(
+        side_effect=RuntimeError("simulated playout failure")
+    )
+
     with pytest.raises(StopResponse):
         await end_call(mock_context)
 
     assert state.call_ended is True
-    # Verify strong reference is stored in background_tasks
-    assert len(state.background_tasks) == 1
-
-    # Allow background task to execute
-    for task in list(state.background_tasks):
-        await task
-
-    mock_session.say.assert_called_once_with(
-        "Do usłyszenia!",
-        allow_interruptions=False,
-    )
-    mock_session.aclose.assert_awaited_once()
-    assert len(state.background_tasks) == 0
+    # Verify warning log was emitted
+    warning_records = [
+        r
+        for r in caplog.records
+        if "wait_for_playout in end_call" in r.message and r.levelname == "WARNING"
+    ]
+    assert len(warning_records) == 1
 
 
 def test_extract_transcript_and_summary() -> None:
@@ -384,3 +498,322 @@ async def test_entrypoint_registers_async_shutdown_callback(
         await registered_cb()
 
     await lk_wrapper("room disconnected")
+
+
+def test_build_transcript_text_chat_context() -> None:
+    """Verifies build_transcript_text converts ChatContext to plain text turns."""
+    chat_ctx = llm.ChatContext()
+    chat_ctx.add_message(role="system", content="System instruction to ignore")
+    chat_ctx.add_message(role="assistant", content="Доброго дня! Чим можу допомогти?")
+    chat_ctx.add_message(
+        role="user", content="Доброго дня, мене цікавить консультація."
+    )
+    chat_ctx.add_message(role="assistant", content="Як я можу до вас звертатися?")
+    chat_ctx.add_message(role="user", content="Я Дмитро.")
+
+    transcript = build_transcript_text(chat_ctx)
+    lines = transcript.splitlines()
+
+    assert len(lines) == 4
+    assert lines[0] == "Agent: Доброго дня! Чим можу допомогти?"
+    assert lines[1] == "User: Доброго дня, мене цікавить консультація."
+    assert lines[2] == "Agent: Як я можу до вас звертатися?"
+    assert lines[3] == "User: Я Дмитро."
+    assert "System instruction" not in transcript
+
+
+def test_build_transcript_text_list_items() -> None:
+    """Verifies build_transcript_text handles list-of-dicts representation."""
+    items = [
+        {"role": "system", "content": "Ignore this"},
+        {"role": "assistant", "content": "Hello!"},
+        {"role": "user", "content": "Hi there."},
+        {"role": "assistant", "content": "   "},  # empty turn skipped
+    ]
+    transcript = build_transcript_text(items)
+    assert transcript == "Agent: Hello!\nUser: Hi there."
+
+
+@pytest.mark.asyncio
+async def test_extract_answers_full_mocked() -> None:
+    """Verifies extract_answers parses complete answers from a mocked LLM response."""
+    question_keys = ["name", "service", "timeline", "preferred_call_time"]
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(
+        {
+            "answers": {
+                "name": "Тарас Шевченко",
+                "service": "Встановлення сонячних панелей",
+                "timeline": "через місяць",
+                "preferred_call_time": "завтра о другій годині",
+            },
+            "missing": [],
+        }
+    )
+
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+    transcript = "Agent: Як вас звати?\nUser: Тарас Шевченко."
+    result = await extract_answers(
+        transcript=transcript,
+        question_keys=question_keys,
+        client=mock_client,
+    )
+
+    assert result["status"] == "ok"
+    assert result["answers"]["name"] == "Тарас Шевченко"
+    assert result["answers"]["service"] == "Встановлення сонячних панелей"
+    assert result["answers"]["timeline"] == "через місяць"
+    assert result["answers"]["preferred_call_time"] == "завтра о другій годині"
+    assert result["missing"] == []
+
+
+@pytest.mark.asyncio
+async def test_extract_answers_partial_mocked() -> None:
+    """Verifies extract_answers identifies missing fields and raw wording."""
+    question_keys = ["name", "service", "timeline", "preferred_call_time"]
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(
+        {
+            "answers": {
+                "name": "Оксана",
+                "service": None,
+                "preferred_call_time": "anytime tomorrow afternoon after 3pm",
+            },
+            "missing": ["service"],
+        }
+    )
+
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+    result = await extract_answers(
+        transcript="Agent: Привіт\nUser: Я Оксана",
+        question_keys=question_keys,
+        client=mock_client,
+    )
+
+    assert result["status"] == "ok"
+    assert result["answers"]["name"] == "Оксана"
+    assert result["answers"]["service"] is None
+    assert result["answers"]["timeline"] is None
+    assert (
+        result["answers"]["preferred_call_time"]
+        == "anytime tomorrow afternoon after 3pm"
+    )
+    assert sorted(result["missing"]) == ["service", "timeline"]
+
+
+@pytest.mark.asyncio
+async def test_extract_answers_invalid_json() -> None:
+    """Verifies invalid JSON does not crash worker and marks extraction_failed."""
+    question_keys = ["name", "service"]
+    mock_response = MagicMock()
+    mock_response.text = "This is not valid JSON at all: {foo: bar"
+
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+    result = await extract_answers(
+        transcript="Agent: Привіт\nUser: Привіт",
+        question_keys=question_keys,
+        client=mock_client,
+    )
+
+    assert result["status"] == "extraction_failed"
+    assert result["answers"] == {"name": None, "service": None}
+    assert result["missing"] == ["name", "service"]
+    assert "error" in result
+    assert len(result["error"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_extract_answers_timeout() -> None:
+    """Verifies timeout from LLM does not crash worker and marks extraction_failed."""
+    question_keys = ["name", "service"]
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=TimeoutError())
+
+    result = await extract_answers(
+        transcript="Agent: Привіт\nUser: Привіт",
+        question_keys=question_keys,
+        client=mock_client,
+    )
+
+    assert result["status"] == "extraction_failed"
+    assert result["answers"] == {"name": None, "service": None}
+    assert result["missing"] == ["name", "service"]
+    assert result["error"].startswith("TimeoutError:")
+    assert "timed out" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_extract_answers_api_error() -> None:
+    """Verifies API error does not crash, masks phones, and truncates error."""
+    question_keys = ["name", "service"]
+    mock_client = MagicMock()
+    long_msg = "Connection failed for +380501234567: " + ("detail " * 40)
+    mock_client.aio.models.generate_content = AsyncMock(
+        side_effect=RuntimeError(long_msg)
+    )
+
+    result = await extract_answers(
+        transcript="Agent: Привіт\nUser: Привіт",
+        question_keys=question_keys,
+        client=mock_client,
+    )
+
+    assert result["status"] == "extraction_failed"
+    assert result["answers"] == {"name": None, "service": None}
+    assert result["missing"] == ["name", "service"]
+    assert result["error"].startswith("RuntimeError:")
+    # Verify phone number was masked in error
+    assert "+380501234567" not in result["error"]
+    assert mask_phone_number("+380501234567") in result["error"]
+    # Verify error message is truncated to <= 200 chars after prefix
+    prefix_len = len("RuntimeError: ")
+    assert len(result["error"]) <= prefix_len + 200
+
+
+def test_format_short_error_with_status_code() -> None:
+    """Verifies format_short_error includes status code and truncates long body."""
+
+    class CustomAPIError(Exception):
+        status_code = 503
+
+    err = CustomAPIError("X" * 300)
+    formatted = format_short_error(err)
+    assert formatted.startswith("CustomAPIError: 503 ")
+    assert len(formatted) == len("CustomAPIError: 503 ") + 200
+
+
+@pytest.mark.asyncio
+async def test_extract_answers_empty_transcript() -> None:
+    """Verifies empty transcript returns null answers without calling LLM."""
+    question_keys = ["name", "service", "timeline"]
+    mock_client = MagicMock()
+
+    result = await extract_answers(
+        transcript="",
+        question_keys=question_keys,
+        client=mock_client,
+    )
+
+    assert result["status"] == "ok"
+    assert result["answers"] == {"name": None, "service": None, "timeline": None}
+    assert result["missing"] == ["name", "service", "timeline"]
+    mock_client.aio.models.generate_content.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_entrypoint_room_closed_before_participant_joined(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies entrypoint logs info and returns cleanly on empty room RuntimeError."""
+    from agent.worker import entrypoint
+
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
+    monkeypatch.setattr(settings, "deepgram_api_key", "test-key")
+    monkeypatch.setattr(settings, "elevenlabs_api_key", "test-key")
+
+    mock_ctx = MagicMock()
+    mock_ctx.job.metadata = None
+    mock_ctx.room.name = "test-empty-room"
+    mock_ctx.connect = AsyncMock()
+    mock_ctx.wait_for_participant = AsyncMock(
+        side_effect=RuntimeError("room closed before participant joined")
+    )
+
+    # Must return cleanly without raising
+    with caplog.at_level("INFO"):
+        await entrypoint(mock_ctx)
+
+    mock_ctx.connect.assert_awaited_once()
+    mock_ctx.wait_for_participant.assert_awaited_once()
+    assert "room closed before participant joined" in caplog.text
+
+
+def test_save_call_summary(tmp_path: Path) -> None:
+    """Verifies save_call_summary creates dir and writes pretty JSON."""
+    summary = {
+        "room": "test-room-456",
+        "answers": {"name": "Іван"},
+        "missing": ["service"],
+        "transcript": [{"role": "user", "content": "Іван"}],
+    }
+    calls_dir = tmp_path / "calls"
+    file_path = save_call_summary("test-room-456", summary, base_dir=calls_dir)
+
+    assert file_path.exists()
+    content = json.loads(file_path.read_text(encoding="utf-8"))
+    assert content["room"] == "test-room-456"
+    assert content["answers"]["name"] == "Іван"
+    assert content["missing"] == ["service"]
+
+
+@pytest.mark.asyncio
+async def test_post_call_extraction_and_summary_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies post_call_extraction_and_summary writes summary and logs correctly."""
+    from agent.metrics import ActiveModels, SessionMetricsCollector
+
+    script = load_script()
+    state = SessionState()
+    chat_ctx = llm.ChatContext()
+    chat_ctx.add_message(role="assistant", content="Доброго дня!")
+    chat_ctx.add_message(role="user", content="Доброго дня, мене звати Тарас.")
+
+    metrics_collector = SessionMetricsCollector(
+        room_name="test-room-extraction",
+        models=ActiveModels(
+            llm_provider="google",
+            llm_model="gemini-3.5-flash-lite",
+            stt_provider="deepgram",
+            stt_model="nova-3",
+            tts_provider="elevenlabs",
+            tts_model="eleven_turbo_v2_5",
+            tts_voice_id="voice-id",
+        ),
+    )
+
+    calls_dir = tmp_path / "calls"
+
+    # Patch save_call_summary to write into tmp_path
+    def mock_save(room: str, summary: dict[str, Any], base_dir: Any = None) -> Path:
+        return save_call_summary(room, summary, base_dir=calls_dir)
+
+    monkeypatch.setattr("agent.worker.save_call_summary", mock_save)
+
+    # Patch extract_answers to return mock extraction
+    async def mock_extract(
+        transcript: str, question_keys: list[str], **kwargs: Any
+    ) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "answers": {
+                "name": "Тарас",
+                "service": "IT",
+                "timeline": None,
+                "preferred_call_time": None,
+            },
+            "missing": ["timeline", "preferred_call_time"],
+        }
+
+    monkeypatch.setattr("agent.worker.extract_answers", mock_extract)
+
+    summary = await post_call_extraction_and_summary(
+        room_name="test-room-extraction",
+        history=chat_ctx,
+        state=state,
+        metrics_collector=metrics_collector,
+        script=script,
+    )
+
+    assert summary["room"] == "test-room-extraction"
+    assert summary["answers"]["name"] == "Тарас"
+    assert summary["missing"] == ["timeline", "preferred_call_time"]
+    assert state.answers["name"] == "Тарас"
+    assert (calls_dir / "test-room-extraction.json").exists()

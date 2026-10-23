@@ -22,32 +22,12 @@ class SessionState:
 
     closing_phrase: str = ""
     error_phrase: str = ""
-    answers: dict[str, str] = field(default_factory=dict)
+    answers: dict[str, Any] = field(default_factory=dict)
     call_ended: bool = False
     background_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     phone_mode: bool = False
     room_name: str | None = None
     api: LiveKitAPI | None = None
-
-
-def save_answer_to_state(state: SessionState, field_name: str, value: str) -> None:
-    """Helper to record an answer into session state."""
-    state.answers[field_name] = value
-    logger.info("Saved answer for field '%s': %s", field_name, value)
-
-
-@function_tool
-async def save_answer(context: RunContext, field: str, value: str) -> str:
-    """Stores a collected answer in the session state and logs it.
-
-    Args:
-        field: Name of the field being answered (e.g. 'name', 'service',
-            'timeline', 'preferred_call_time').
-        value: The answer value provided by the user.
-    """
-    state: SessionState = context.userdata
-    save_answer_to_state(state, field, value)
-    return f"Saved answer for {field}."
 
 
 async def _say_and_disconnect(
@@ -120,15 +100,35 @@ def terminate_call(
 
 @function_tool
 async def end_call(context: RunContext) -> None:
-    """Speaks the closing phrase and ends the call session.
+    """Terminates call session when questions are done or caller wishes to finish.
+
+    Call this tool when all questions have been asked/answered or when the user
+    wants to finish the call. This tool speaks the goodbye phrase itself, so do
+    NOT say goodbye or speak a farewell in your own reply.
 
     Raises:
         StopResponse: Instructs the LiveKit agent runtime not to generate
-            any follow-up LLM response (preventing a duplicate goodbye).
+            any follow-up LLM response.
     """
+    session = context.session
     state: SessionState = context.userdata
-    logger.info("end_call tool triggered.")
-    terminate_call(context.session, state, state.closing_phrase)
 
-    # StopResponse asks for silence (no reply_required) so the model says nothing more
+    # Check if caller is speaking via LiveKit AgentSession.user_state
+    if session.user_state == "speaking":
+        logger.info("end_call invoked while user is speaking; aborting termination.")
+        return None
+
+    # Wait until the agent's current speech generation/playout finishes
+    try:
+        await context.wait_for_playout()
+    except Exception as e:
+        logger.warning("wait_for_playout in end_call: %s", e)
+
+    # Re-check user state in case caller spoke during playout
+    if session.user_state == "speaking":
+        logger.info("User began speaking during speech playout; aborting termination.")
+        return None
+
+    logger.info("end_call tool triggered, closing call session.")
+    terminate_call(session, state, phrase=state.closing_phrase)
     raise StopResponse()

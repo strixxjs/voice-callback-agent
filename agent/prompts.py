@@ -31,6 +31,11 @@ class ScriptConfig(BaseModel):
     error_phrase: str = ""
     questions: list[QuestionItem] = Field(default_factory=list)
 
+    @property
+    def question_fields(self) -> list[str]:
+        """Returns the list of question field names defined in the script."""
+        return [q.field for q in self.questions]
+
 
 def load_script(path: Path | str | None = None) -> ScriptConfig:
     """Loads and validates conversation script configuration from YAML."""
@@ -58,7 +63,7 @@ def build_system_prompt(script: ScriptConfig) -> str:
     language_name = _LANGUAGE_NAMES.get(script.language.lower(), script.language)
 
     questions_formatted = "\n".join(
-        f"- Field '{q.field}' ({'required' if q.required else 'optional'}): "
+        f"- Question '{q.field}' ({'required' if q.required else 'optional'}): "
         f'"{q.question}"'
         for q in script.questions
     )
@@ -74,7 +79,8 @@ def build_system_prompt(script: ScriptConfig) -> str:
         - NEVER use markdown (no asterisks, bold, italics, headers, backticks).
         - NEVER use bullet points, numbered lists, emojis, tables, or URLs.
         - Keep replies brief and conversational: 1 to 2 sentences per turn.
-        - Ask ONE question at a time. Never ask multiple questions in a single reply.
+        - Ask ONE question at a time using short phrasing.
+          Never ask multiple questions in a single reply.
         - Language: Speak in {language_name} ({script.language}).
         - Address the caller by first name only. NEVER use "пан", "пані", "пане",
           or gendered honorific forms.
@@ -83,19 +89,22 @@ def build_system_prompt(script: ScriptConfig) -> str:
         - NEVER invent prices, discounts, delivery dates, or company facts.
         - If asked about pricing or unknown details, say a manager will follow up.
         - If unsure or if you do not understand, state that a manager will follow up.
-        - If caller is not interested, dialed by mistake, or asks to end call:
-          politely acknowledge, call the `end_call` tool, and say goodbye.
+        - If caller is not interested, dialed by mistake, or asks to end the call,
+          call `end_call()`.
 
         # Conversation Flow & Questions
-        You have already greeted the user. Collect answers for these items in order:
+        You have already greeted the user.
+        Ask the questions in order, one at a time, using short phrasing:
         {questions_formatted}
 
-        # Tools Usage
-        - When the user answers a question, call `save_answer(field=..., value=...)`.
-        - If an optional field is skipped or declined by the user, move on politely.
-        - When all required questions are answered or user wishes to wrap up,
-          call `end_call()` and say nothing more.
-          The closing phrase will be spoken automatically:
-          "{script.closing_phrase}"
+        - Never re-ask a question that was already answered
+          (even if answered earlier or out of order).
+        - If an answer is unclear, ask ONE short clarification, then move on.
+        - If an optional question is skipped or declined by the user, move on politely.
+        - When all questions are done or the caller wants to finish, call `end_call()`.
+        - Do NOT say goodbye or speak a farewell yourself in your reply;
+          `end_call()` speaks the farewell closing phrase automatically.
+        - NEVER call `end_call()` in the middle of the user's answer or while
+          the user is still speaking.
         """
     )
