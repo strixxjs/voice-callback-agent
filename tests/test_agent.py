@@ -340,7 +340,6 @@ def test_sync_google_thought_signatures_missing_attribute(
     assert "attribute missing" in caplog.text
 
 
-
 @pytest.mark.asyncio
 async def test_entrypoint_registers_async_shutdown_callback(
     monkeypatch: pytest.MonkeyPatch,
@@ -385,4 +384,3 @@ async def test_entrypoint_registers_async_shutdown_callback(
         await registered_cb()
 
     await lk_wrapper("room disconnected")
-

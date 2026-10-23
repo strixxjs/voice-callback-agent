@@ -46,9 +46,7 @@ def compute_latency_summary(latencies: list[float]) -> dict[str, float]:
             - max: float (maximum latency rounded to 3 decimal places)
     """
     valid: list[float] = [
-        float(x)
-        for x in latencies
-        if x is not None and isinstance(x, (int, float))
+        float(x) for x in latencies if x is not None and isinstance(x, (int, float))
     ]
     if not valid:
         return {"turns": 0, "avg": 0.0, "p50": 0.0, "max": 0.0}
@@ -179,9 +177,7 @@ class SessionMetricsCollector:
             tts_str = (
                 f"{tts_ttfb:.3f}s" if isinstance(tts_ttfb, (int, float)) else "N/A"
             )
-            total_str = (
-                f"{total_latency:.3f}s" if total_latency is not None else "N/A"
-            )
+            total_str = f"{total_latency:.3f}s" if total_latency is not None else "N/A"
 
             logger.info(
                 "Turn %d latency: EOU=%s | STT=%s | LLM TTFT=%s | TTS TTFB=%s | "

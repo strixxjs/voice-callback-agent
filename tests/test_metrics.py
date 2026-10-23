@@ -90,19 +90,14 @@ def test_provider_model_and_voice_resolution() -> None:
     # Deepgram + ElevenLabs defaults when settings models/voices are None
     assert resolve_stt_model("deepgram", None) == "nova-3"
     assert resolve_tts_model("elevenlabs", None) == "eleven_turbo_v2_5"
-    assert (
-        resolve_tts_voice("elevenlabs", None) == DEFAULT_ELEVENLABS_VOICE_ID
-    )
+    assert resolve_tts_voice("elevenlabs", None) == DEFAULT_ELEVENLABS_VOICE_ID
 
     # Explicit values override defaults
     assert resolve_stt_model("openai", "whisper-custom") == "whisper-custom"
     assert resolve_tts_model("openai", "tts-1-hd") == "tts-1-hd"
     assert resolve_tts_voice("openai", "nova") == "nova"
     assert resolve_stt_model("deepgram", "nova-2") == "nova-2"
-    assert (
-        resolve_tts_model("elevenlabs", "eleven_flash_v2_5")
-        == "eleven_flash_v2_5"
-    )
+    assert resolve_tts_model("elevenlabs", "eleven_flash_v2_5") == "eleven_flash_v2_5"
     assert resolve_tts_voice("elevenlabs", "custom-voice-id") == "custom-voice-id"
 
 
@@ -146,7 +141,9 @@ def test_session_metrics_collector_sdk_source(tmp_path: Path) -> None:
         "tts_node_ttfb": 0.284,
         "e2e_latency": 1.217,
     }
-    collector._on_conversation_item_added(ConversationItemAddedEvent(item=assistant_msg))
+    collector._on_conversation_item_added(
+        ConversationItemAddedEvent(item=assistant_msg)
+    )
 
     assert collector.turn_index == 1
     assert collector.turn_latencies == [1.217]
@@ -204,7 +201,9 @@ def test_session_metrics_collector_fallback_computed(tmp_path: Path) -> None:
         "llm_node_ttft": 0.350,
         "tts_node_ttfb": 0.150,
     }
-    collector._on_conversation_item_added(ConversationItemAddedEvent(item=assistant_msg))
+    collector._on_conversation_item_added(
+        ConversationItemAddedEvent(item=assistant_msg)
+    )
 
     assert collector.turn_index == 1
     # Formula: 0.500 + 0.350 + 0.150 = 1.000
@@ -236,7 +235,9 @@ def test_session_metrics_collector_partial_missing(tmp_path: Path) -> None:
         "llm_node_ttft": 0.300,
         # missing tts_node_ttfb and e2e_latency
     }
-    collector._on_conversation_item_added(ConversationItemAddedEvent(item=assistant_msg))
+    collector._on_conversation_item_added(
+        ConversationItemAddedEvent(item=assistant_msg)
+    )
 
     assert collector.turn_index == 1
     # Must NOT invent zeros: total is None and not added to turn_latencies
@@ -334,7 +335,9 @@ def test_session_metrics_collector_split_user_turn(tmp_path: Path) -> None:
         "tts_node_ttfb": 0.214,
         "e2e_latency": 2.191,
     }
-    collector._on_conversation_item_added(ConversationItemAddedEvent(item=assistant_msg))
+    collector._on_conversation_item_added(
+        ConversationItemAddedEvent(item=assistant_msg)
+    )
 
     assert collector.turn_index == 1
     assert collector.turn_latencies == [2.191]
@@ -349,4 +352,3 @@ def test_session_metrics_collector_split_user_turn(tmp_path: Path) -> None:
     assert record["tts_ttfb"] == 0.214
     assert record["total_response_latency"] == 2.191
     assert record["e2e_source"] == "sdk"
-
