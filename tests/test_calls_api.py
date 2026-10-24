@@ -227,7 +227,7 @@ async def test_overview_not_configured(async_client: httpx.AsyncClient) -> None:
         "M0": "done",
         "M1": "done",
         "M2": "done",
-        "M3": "in_progress",
+        "M3": "done",
         "M4": "done",
         "M5": "planned",
         "M6": "planned",

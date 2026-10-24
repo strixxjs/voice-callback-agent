@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -32,6 +34,8 @@ from agent.worker import (
     VoiceCallbackAgent,
     extract_transcript,
     get_llm,
+    get_stt,
+    get_turn_handling,
     log_session_summary,
     post_call_extraction_and_summary,
 )
@@ -152,6 +156,18 @@ def test_build_system_prompt_rules() -> None:
     assert "farewell" in prompt.lower()
     assert "only after the user has answered the last question" in prompt.lower()
     assert "never ask a question and call `end_call()`" in prompt.lower()
+    assert (
+        "ask every question from the list in order, including optional ones"
+        in prompt.lower()
+    )
+    assert '"optional" only means the caller may decline to answer it' in prompt.lower()
+    assert "never skip asking it" in prompt.lower()
+    assert "new information, or a correction" in prompt.lower()
+    assert "first reply in one or two short" in prompt.lower()
+    assert "sentences in the call language" in prompt.lower()
+    assert "explicitly acknowledge a correction" in prompt.lower()
+    assert "merely thanks you or says goodbye" in prompt.lower()
+    assert "right away without extra words" in prompt.lower()
 
 
 def test_build_system_prompt_language_switch() -> None:
@@ -232,7 +248,7 @@ async def test_end_call_waits_for_playout_and_disconnects() -> None:
         await task
 
     # Closing phrase was passed to terminate_call -> spoken via session.say
-    mock_session.say.assert_called_once_with(closing, allow_interruptions=False)
+    mock_session.say.assert_called_once_with(closing, allow_interruptions=True)
     mock_handle.wait_for_playout.assert_awaited_once()
     mock_session.aclose.assert_awaited_once()
     assert len(state.background_tasks) == 0
@@ -547,7 +563,7 @@ async def test_end_call_allowed_when_user_answered() -> None:
     assert len(state.background_tasks) == 1
     for task in list(state.background_tasks):
         await task
-    mock_session.say.assert_called_once_with(closing, allow_interruptions=False)
+    mock_session.say.assert_called_once_with(closing, allow_interruptions=True)
     mock_session.aclose.assert_awaited_once()
 
 
@@ -581,7 +597,7 @@ async def test_end_call_allowed_when_user_requested_to_finish() -> None:
     assert state.call_ended is True
     for task in list(state.background_tasks):
         await task
-    mock_session.say.assert_called_once_with(closing, allow_interruptions=False)
+    mock_session.say.assert_called_once_with(closing, allow_interruptions=True)
 
 
 @pytest.mark.asyncio
@@ -615,7 +631,7 @@ async def test_end_call_allowed_when_no_question_asked() -> None:
     assert state.call_ended is True
     for task in list(state.background_tasks):
         await task
-    mock_session.say.assert_called_once_with(closing, allow_interruptions=False)
+    mock_session.say.assert_called_once_with(closing, allow_interruptions=True)
 
 
 def test_extract_transcript_and_summary() -> None:
@@ -1500,3 +1516,531 @@ async def test_entrypoint_session_close_event_triggers_shutdown_and_single_final
     await registered_cb()
     mock_reporter.report_ended.assert_called_once()
     mock_reporter.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_end_call_guard(caplog: pytest.LogCaptureFixture) -> None:
+    """Verifies that when ending_in_progress is True,
+    a concurrent end_call returns None with a log line.
+    """
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.aclose = AsyncMock()
+
+    state = SessionState(closing_phrase="Bye", ending_in_progress=True)
+    mock_context = MagicMock()
+    mock_context.userdata = state
+    mock_context.session = mock_session
+
+    with caplog.at_level("INFO"):
+        res = await end_call(mock_context)
+
+    assert res is None
+    assert any(
+        "end_call rejected: ending already in progress" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_end_call_grace_aborts_on_user_transcript(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies that user speech during grace period aborts end_call
+    and returns None.
+    """
+    monkeypatch.setattr(settings, "end_call_grace_period", 0.05)
+    state = SessionState(closing_phrase="Bye")
+
+    listeners: dict[str, list[Any]] = {}
+
+    def mock_on(event: str, cb: Any) -> None:
+        listeners.setdefault(event, []).append(cb)
+
+    def mock_off(event: str, cb: Any) -> None:
+        if event in listeners and cb in listeners[event]:
+            listeners[event].remove(cb)
+
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.on = MagicMock(side_effect=mock_on)
+    mock_session.off = MagicMock(side_effect=mock_off)
+    mock_session.say = MagicMock()
+    mock_session.aclose = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.userdata = state
+    mock_context.session = mock_session
+    mock_context.wait_for_playout = AsyncMock()
+
+    async def emit_speech_during_grace() -> None:
+        await asyncio.sleep(0.01)
+        mock_ev = MagicMock()
+        mock_ev.transcript = "Зачекайте, будь ласка!"
+        mock_ev.is_final = True
+        for cb in list(listeners.get("user_input_transcribed", [])):
+            cb(mock_ev)
+
+    asyncio.create_task(emit_speech_during_grace())
+
+    with caplog.at_level("INFO"):
+        res = await end_call(mock_context)
+
+    assert res is None
+    assert state.call_ended is False
+    assert mock_session.off.called
+    assert any(
+        "end_call aborted: user spoke during grace period" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_end_call_grace_ignores_noise(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that noise (user_state speaking with no transcript)
+    during grace window is ignored and call terminates.
+    """
+    monkeypatch.setattr(settings, "end_call_grace_period", 0.02)
+    monkeypatch.setattr(settings, "end_call_noise_timeout_cap", 0.03)
+    state = SessionState(closing_phrase="Bye")
+
+    mock_handle = MagicMock()
+    mock_handle.wait_for_playout = AsyncMock()
+
+    listeners: dict[str, list[Any]] = {}
+
+    def mock_on(event: str, cb: Any) -> None:
+        listeners.setdefault(event, []).append(cb)
+
+    def mock_off(event: str, cb: Any) -> None:
+        if event in listeners and cb in listeners[event]:
+            listeners[event].remove(cb)
+
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.on = MagicMock(side_effect=mock_on)
+    mock_session.off = MagicMock(side_effect=mock_off)
+    mock_session.say = MagicMock(return_value=mock_handle)
+    mock_session.aclose = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.userdata = state
+    mock_context.session = mock_session
+    mock_context.wait_for_playout = AsyncMock()
+
+    async def simulate_noise_during_grace() -> None:
+        await asyncio.sleep(0.01)
+        # Background noise triggers user_state = speaking briefly
+        mock_session.user_state = "speaking"
+        # STT emits empty/whitespace transcript
+        mock_ev = MagicMock()
+        mock_ev.transcript = "   "
+        mock_ev.is_final = True
+        for cb in list(listeners.get("user_input_transcribed", [])):
+            cb(mock_ev)
+        await asyncio.sleep(0.01)
+        mock_session.user_state = "listening"
+
+    asyncio.create_task(simulate_noise_during_grace())
+
+    with pytest.raises(StopResponse):
+        await end_call(mock_context)
+
+    assert state.call_ended is True
+    assert mock_session.off.called
+
+
+@pytest.mark.asyncio
+async def test_closing_phrase_interrupted_resets_call_ended() -> None:
+    """Verifies that when closing phrase is interrupted by caller speech,
+    call_ended is reset to False and goodbye_count increments.
+    """
+    state = SessionState(closing_phrase="Дякую за розмову! До побачення!")
+
+    listeners: dict[str, list[Any]] = {}
+
+    def mock_on(event: str, cb: Any) -> None:
+        listeners.setdefault(event, []).append(cb)
+
+    def mock_off(event: str, cb: Any) -> None:
+        if event in listeners and cb in listeners[event]:
+            listeners[event].remove(cb)
+
+    mock_handle = MagicMock()
+    mock_handle.interrupted = True
+
+    async def mock_wait_playout() -> None:
+        # Simulate user speech transcript arriving during playout
+        mock_ev = MagicMock()
+        mock_ev.transcript = "А яка ціна?"
+        mock_ev.is_final = True
+        for cb in list(listeners.get("user_input_transcribed", [])):
+            cb(mock_ev)
+
+    mock_handle.wait_for_playout = AsyncMock(side_effect=mock_wait_playout)
+
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.on = MagicMock(side_effect=mock_on)
+    mock_session.off = MagicMock(side_effect=mock_off)
+    mock_session.say = MagicMock(return_value=mock_handle)
+    mock_session.aclose = AsyncMock()
+
+    task = terminate_call(
+        mock_session, state, phrase=state.closing_phrase, allow_interruptions=True
+    )
+    assert task is not None
+    await task
+
+    # Real user speech interrupted the closing phrase
+    assert state.call_ended is False
+    assert state.goodbye_count == 1
+    mock_session.aclose.assert_not_called()
+    assert mock_session.off.called
+
+
+@pytest.mark.asyncio
+async def test_end_call_grace_ignores_interim_transcripts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies that interim transcripts (is_final=False) during grace
+    window are ignored and call terminates.
+    """
+    monkeypatch.setattr(settings, "end_call_grace_period", 0.02)
+    state = SessionState(closing_phrase="Bye")
+
+    mock_handle = MagicMock()
+    mock_handle.wait_for_playout = AsyncMock()
+
+    listeners: dict[str, list[Any]] = {}
+
+    def mock_on(event: str, cb: Any) -> None:
+        listeners.setdefault(event, []).append(cb)
+
+    def mock_off(event: str, cb: Any) -> None:
+        if event in listeners and cb in listeners[event]:
+            listeners[event].remove(cb)
+
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.on = MagicMock(side_effect=mock_on)
+    mock_session.off = MagicMock(side_effect=mock_off)
+    mock_session.say = MagicMock(return_value=mock_handle)
+    mock_session.aclose = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.userdata = state
+    mock_context.session = mock_session
+    mock_context.wait_for_playout = AsyncMock()
+
+    async def simulate_interim_during_grace() -> None:
+        await asyncio.sleep(0.01)
+        mock_ev = MagicMock()
+        mock_ev.transcript = "Зачекайте"
+        mock_ev.is_final = False  # Interim event only!
+        for cb in list(listeners.get("user_input_transcribed", [])):
+            cb(mock_ev)
+
+    asyncio.create_task(simulate_interim_during_grace())
+
+    with pytest.raises(StopResponse):
+        await end_call(mock_context)
+
+    assert state.call_ended is True
+    assert mock_session.off.called
+
+
+@pytest.mark.asyncio
+async def test_closing_phrase_interim_transcript_does_not_abort() -> None:
+    """Verifies that interim transcripts (is_final=False) during closing
+    phrase playout do not abort termination.
+    """
+    state = SessionState(closing_phrase="Дякую за розмову! До побачення!")
+
+    listeners: dict[str, list[Any]] = {}
+
+    def mock_on(event: str, cb: Any) -> None:
+        listeners.setdefault(event, []).append(cb)
+
+    def mock_off(event: str, cb: Any) -> None:
+        if event in listeners and cb in listeners[event]:
+            listeners[event].remove(cb)
+
+    mock_handle = MagicMock()
+    mock_handle.interrupted = True
+
+    async def mock_wait_playout() -> None:
+        mock_ev = MagicMock()
+        mock_ev.transcript = "Але..."
+        mock_ev.is_final = False  # Interim only
+        for cb in list(listeners.get("user_input_transcribed", [])):
+            cb(mock_ev)
+
+    mock_handle.wait_for_playout = AsyncMock(side_effect=mock_wait_playout)
+
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.on = MagicMock(side_effect=mock_on)
+    mock_session.off = MagicMock(side_effect=mock_off)
+    mock_session.say = MagicMock(return_value=mock_handle)
+    mock_session.aclose = AsyncMock()
+
+    task = terminate_call(
+        mock_session, state, phrase=state.closing_phrase, allow_interruptions=True
+    )
+    assert task is not None
+    await task
+
+    # Session terminates because only interim transcripts were received
+    assert state.call_ended is True
+    assert state.goodbye_count == 0
+    mock_session.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_terminate_call_default_uninterruptible_and_end_call_interruptible() -> (
+    None
+):
+    """Verifies terminate_call defaults to allow_interruptions=False
+    and end_call uses True.
+    """
+    state1 = SessionState(error_phrase="Помилка")
+    mock_handle1 = MagicMock()
+    mock_handle1.wait_for_playout = AsyncMock()
+    mock_session1 = MagicMock()
+    mock_session1.say = MagicMock(return_value=mock_handle1)
+    mock_session1.aclose = AsyncMock()
+
+    # Default terminate_call call
+    task = terminate_call(mock_session1, state1, state1.error_phrase)
+    assert task is not None
+    await task
+    mock_session1.say.assert_called_once_with("Помилка", allow_interruptions=False)
+
+    # end_call tool call
+    state2 = SessionState(closing_phrase="Бувайте")
+    mock_handle2 = MagicMock()
+    mock_handle2.wait_for_playout = AsyncMock()
+    mock_session2 = MagicMock()
+    mock_session2.user_state = "listening"
+    mock_session2.say = MagicMock(return_value=mock_handle2)
+    mock_session2.aclose = AsyncMock()
+
+    mock_ctx = MagicMock()
+    mock_ctx.userdata = state2
+    mock_ctx.session = mock_session2
+    mock_ctx.wait_for_playout = AsyncMock()
+
+    with pytest.raises(StopResponse):
+        await end_call(mock_ctx)
+
+    for bg_task in list(state2.background_tasks):
+        await bg_task
+    mock_session2.say.assert_called_once_with("Бувайте", allow_interruptions=True)
+
+
+@pytest.mark.asyncio
+async def test_second_end_call_uses_short_goodbye() -> None:
+    """Verifies that a subsequent end_call after interruption uses short_goodbye."""
+    state = SessionState(
+        closing_phrase="Дякую за розмову! Менеджер зв'яжеться з вами найближчим часом.",
+        short_goodbye="До побачення!",
+        goodbye_count=1,
+    )
+
+    mock_handle = MagicMock()
+    mock_handle.wait_for_playout = AsyncMock()
+
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.say = MagicMock(return_value=mock_handle)
+    mock_session.aclose = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.userdata = state
+    mock_context.session = mock_session
+    mock_context.wait_for_playout = AsyncMock()
+
+    with pytest.raises(StopResponse):
+        await end_call(mock_context)
+
+    assert state.call_ended is True
+    for task in list(state.background_tasks):
+        await task
+
+    mock_session.say.assert_called_once_with("До побачення!", allow_interruptions=True)
+
+
+@pytest.mark.asyncio
+async def test_pending_question_guard_on_second_end_call() -> None:
+    """Verifies pending question guard still blocks second end_call
+    if question was asked.
+    """
+    state = SessionState(
+        closing_phrase="Дякую!",
+        short_goodbye="До побачення!",
+        goodbye_count=1,
+    )
+
+    chat_ctx = llm.ChatContext()
+    chat_ctx.add_message(role="assistant", content="О котрій годині зателефонувати?")
+
+    mock_session = MagicMock()
+    mock_session.user_state = "listening"
+    mock_session.history = chat_ctx
+    mock_session.say = MagicMock()
+    mock_session.aclose = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.userdata = state
+    mock_context.session = mock_session
+    mock_context.wait_for_playout = AsyncMock()
+
+    res = await end_call(mock_context)
+    assert res is None
+    assert state.call_ended is False
+    mock_session.say.assert_not_called()
+
+
+def test_endpointing_mode_and_keyterms_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies endpointing mode is propagated and STT keyterms are
+    passed to Deepgram nova-3.
+    """
+    monkeypatch.setattr(settings, "endpointing_mode", "dynamic")
+    opts = get_turn_handling()
+    assert opts["endpointing"]["mode"] == "dynamic"
+
+    monkeypatch.setattr(settings, "stt_provider", "deepgram")
+    monkeypatch.setattr(settings, "stt_model", "nova-3")
+    monkeypatch.setattr(settings, "stt_keyterms", "Solaris, CRM, автоматизація")
+
+    with patch("livekit.plugins.deepgram.STT") as mock_stt_cls:
+        get_stt("uk")
+        mock_stt_cls.assert_called_once()
+        _, kwargs = mock_stt_cls.call_args
+        assert kwargs.get("keyterm") == ["Solaris", "CRM", "автоматизація"]
+
+
+def test_eval_call_markdown_output() -> None:
+    """Verifies eval_call row formatting, agent role, extraction deduplication,
+    and '-' for empty latency.
+    """
+    from app.models import Call, CallEvent, CallTurn
+    from scripts.eval_call import (
+        count_error_events,
+        count_split_turns,
+        format_eval_row,
+        format_extraction_status,
+    )
+
+    now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=UTC)
+    turns = [
+        CallTurn(turn_index=0, role="agent", content="Вітаю!", timestamp=now),
+        CallTurn(turn_index=1, role="user", content="Добрий день", timestamp=now),
+        CallTurn(turn_index=2, role="user", content="Я щодо CRM", timestamp=now),
+        CallTurn(turn_index=3, role="agent", content="Яка послуга?", timestamp=now),
+    ]
+    events = [
+        CallEvent(
+            event_type="stt_error", message="Deepgram socket timeout", timestamp=now
+        ),
+    ]
+    call = Call(
+        id=uuid.UUID("11111111-2222-3333-4444-555555555555"),
+        room_name="call_+380501234567",
+        created_at=now,
+        latency_summary={
+            "turns": 2,
+            "p50_measured": 1.120,
+            "max_measured": 1.450,
+            "p50_computed": 1.250,
+        },
+        extracted_answers={"name": "Іван", "service": "CRM", "empty_field": ""},
+        extracted_missing=["timeline", "service", "preferred_call_time"],
+        extraction_status="completed",
+        turns=turns,
+        events=events,
+        status="completed",
+    )
+
+    assert count_split_turns(turns) == 1
+    assert count_error_events(events) == 1
+
+    # extraction: answered = 2 ("name", "service" - "empty_field" excluded)
+    # missing = 2 ("timeline", "preferred_call_time" - "service" already in answered)
+    # total = 2 + 2 = 4 -> "2/4"
+    assert format_extraction_status(call) == "2/4"
+
+    row = format_eval_row(call, variant="baseline")
+    assert "| 11111111 |" in row  # Run label = first 8 chars of call id
+    assert "| 2026-10-24 |" in row
+    assert "| baseline |" in row
+    assert "| 2 |" in row
+    assert "| 1.120s |" in row
+    assert "| 1.450s |" in row
+    assert "| 1.250s |" in row
+    assert "| 1 |" in row  # split turns
+    assert "| - | - |" in row  # Lost words = "-", STT errors = "-"
+    assert "| 2/4 |" in row  # extraction
+    assert "errors=1, ended_by=completed" in row  # Notes
+
+    # Test default variant when not given
+    row_no_var = format_eval_row(call)
+    assert "| 11111111 | 2026-10-24 | - | 2 |" in row_no_var
+
+    # Test empty latency summary prints "-"
+    empty_call = Call(
+        id=uuid.UUID("22222222-2222-3333-4444-555555555555"),
+        created_at=now,
+        latency_summary={"turns": 0, "avg": 0.0, "p50": 0.0, "max": 0.0},
+        status="completed",
+    )
+    row_empty = format_eval_row(empty_call)
+    expected_empty = (
+        "| 22222222 | 2026-10-24 | - | 0 | - | - | - | 0 | - | - | - | "
+        "errors=0, ended_by=completed |"
+    )
+    assert expected_empty in row_empty
+
+
+def test_eval_call_agent_role_and_extraction_edge_cases() -> None:
+    """Tests agent role fallback turn count and extraction deduplication edge cases."""
+    from app.models import Call, CallTurn
+    from scripts.eval_call import format_eval_row, format_extraction_status
+
+    now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=UTC)
+
+    # 1. Agent role is "agent" - fallback when latency_summary has no turns count
+    call_no_lat = Call(
+        id=uuid.UUID("33333333-3333-3333-3333-333333333333"),
+        created_at=now,
+        latency_summary=None,
+        turns=[
+            CallTurn(turn_index=0, role="agent", content="Hello", timestamp=now),
+            CallTurn(turn_index=1, role="user", content="Hi", timestamp=now),
+            CallTurn(turn_index=2, role="agent", content="Help?", timestamp=now),
+            CallTurn(turn_index=3, role="user", content="Bye", timestamp=now),
+        ],
+        status="completed",
+    )
+    row = format_eval_row(call_no_lat)
+    # Turns column should be 2 (counting only role="agent")
+    assert "| 33333333 | 2026-10-24 | - | 2 |" in row
+
+    # 2. Extraction deduplication and empty value filtering
+    call_overlap = Call(
+        id=uuid.UUID("44444444-4444-4444-4444-444444444444"),
+        created_at=now,
+        extracted_answers={
+            "f1": "val1",
+            "f2": None,
+            "f3": "",
+            "f4": "   ",
+            "f5": "val5",
+        },
+        extracted_missing=["f1", "f2", "f5", "f6"],
+    )
+    # answered: f1, f5 -> 2
+    # missing: f2, f6 (f1 and f5 are already in answered so not double counted) -> 2
+    # total = 2 + 2 = 4 -> "2/4"
+    assert format_extraction_status(call_overlap) == "2/4"
