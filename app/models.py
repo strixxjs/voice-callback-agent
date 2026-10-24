@@ -102,6 +102,10 @@ class Call(Base):
         PortableJSON,
         nullable=True,
     )
+    call_config: Mapped[dict[str, Any] | None] = mapped_column(
+        PortableJSON,
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),
         server_default=func.now(),
@@ -153,6 +157,10 @@ class CallTurn(Base):
     timestamp: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),
         nullable=False,
+    )
+    metrics: Mapped[dict[str, Any] | None] = mapped_column(
+        PortableJSON,
+        nullable=True,
     )
 
     call: Mapped[Call] = relationship("Call", back_populates="turns")

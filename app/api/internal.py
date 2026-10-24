@@ -61,6 +61,7 @@ class CallTurnRequest(BaseModel):
     role: str
     content: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    metrics: dict[str, Any] | None = None
 
 
 class CallEndedRequest(BaseModel):
@@ -88,20 +89,25 @@ async def record_call_event(
     """Records an operational lifecycle event for a call."""
     call = await _get_call_or_404(db, call_id)
 
-    if request.event_type == "participant_joined" and (
-        call.status == call_service.CALL_STATUS_DIALING or call.started_at is None
+    call_config = (
+        request.payload.pop("call_config", None)
+        if isinstance(request.payload, dict)
+        else None
+    )
+
+    if (
+        request.event_type in ("participant_joined", "call_answered")
+        and call.status == call_service.CALL_STATUS_DIALING
     ):
-        new_status = (
-            call_service.CALL_STATUS_IN_PROGRESS
-            if call.status == call_service.CALL_STATUS_DIALING
-            else call.status
-        )
         await call_service.update_call_status(
             db,
             call,
-            new_status,
+            call_service.CALL_STATUS_IN_PROGRESS,
             started_at=call.started_at or request.timestamp,
+            call_config=call_config,
         )
+    elif call_config is not None:
+        await call_service.set_call_config(db, call, call_config)
 
     await call_service.append_call_event(
         db,
@@ -134,6 +140,7 @@ async def record_call_turn(
         role=request.role,
         content=request.content,
         timestamp=request.timestamp,
+        metrics=request.metrics,
     )
     return {"status": "ok"}
 

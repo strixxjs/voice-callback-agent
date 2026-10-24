@@ -116,3 +116,54 @@ async def test_call_events_cascade_delete(db_session: AsyncSession) -> None:
     ).all()
     assert len(turns) == 0
     assert len(events) == 0
+
+
+@pytest.mark.asyncio
+async def test_call_config_and_turn_metrics_columns(
+    db_session: AsyncSession,
+) -> None:
+    """Verifies that Call.call_config and CallTurn.metrics persist JSON correctly."""
+    config_data = {
+        "llm_provider": "google",
+        "llm_model": "gemini-3.5-flash-lite",
+        "stt_provider": "deepgram",
+        "stt_model": "nova-3",
+        "preemptive_generation": True,
+    }
+    call = Call(
+        room_name="test-config-room",
+        mode="browser",
+        status="in_progress",
+        call_config=config_data,
+    )
+    db_session.add(call)
+    await db_session.commit()
+    await db_session.refresh(call)
+
+    assert call.call_config == config_data
+
+    metrics_data = {
+        "e2e": 1.234,
+        "e2e_source": "measured",
+        "sdk_e2e": 1.234,
+        "scripted": False,
+        "endpointing_delay": 0.5,
+        "transcript_delay": 0.2,
+        "llm_ttft": 0.35,
+        "tts_ttfb": 0.18,
+        "llm_model": "gemini-3.5-flash-lite",
+        "llm_fallback": False,
+    }
+    turn = CallTurn(
+        call_id=call.id,
+        turn_index=1,
+        role="agent",
+        content="Добрий день!",
+        timestamp=datetime.now(UTC),
+        metrics=metrics_data,
+    )
+    db_session.add(turn)
+    await db_session.commit()
+    await db_session.refresh(turn)
+
+    assert turn.metrics == metrics_data

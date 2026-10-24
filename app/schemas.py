@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints
 
 E164_PATTERN = r"^\+[1-9]\d{7,14}$"
 
@@ -54,6 +54,7 @@ class TranscriptTurn(BaseModel):
     role: str
     text: str
     timestamp: datetime
+    metrics: dict[str, Any] | None = None
 
 
 class CallEventOut(BaseModel):
@@ -70,10 +71,20 @@ class ExtractionOut(BaseModel):
     status: str | None
 
 
+class LatencySummaryOut(BaseModel):
+    p50: float | None = None
+    max: float | None = None
+    llm_turns: int = 0
+    scripted_turns: int = 0
+    fallback_turns: list[int] = Field(default_factory=list)
+
+
 class CallDetail(CallSummary):
     transcript: list[TranscriptTurn]
     events: list[CallEventOut]
     extraction: ExtractionOut | None
+    call_config: dict[str, Any] | None = None
+    latency: LatencySummaryOut | None = None
 
 
 StageStatus = Literal["done", "in_progress", "planned", "deferred"]
