@@ -95,6 +95,8 @@ class SessionMetricsCollector:
         self.turn_index = 0
         self.missing_latency_turns = 0
         self.turn_latencies: list[float] = []
+        self.measured_latencies: list[float] = []
+        self.computed_latencies: list[float] = []
         self._last_user_metrics: dict[str, Any] | None = None
         self._closed = False
 
@@ -146,28 +148,59 @@ class SessionMetricsCollector:
             llm_ttft = assistant_metrics.get("llm_node_ttft")
             tts_ttfb = assistant_metrics.get("tts_node_ttfb")
             raw_total = assistant_metrics.get("e2e_latency")
+            started_speaking = assistant_metrics.get("started_speaking_at")
+            stopped_speaking = user_metrics.get("stopped_speaking_at")
 
-            total_latency: float | None = None
+            # 1. Measured end-to-end latency: time from user stopping speaking
+            # to agent audio playback starting.
+            measured_latency: float | None = None
             if raw_total is not None and isinstance(raw_total, (int, float)):
-                total_latency = float(raw_total)
-                e2e_source = "sdk"
-                self.turn_latencies.append(round(total_latency, 3))
+                measured_latency = float(raw_total)
             elif (
-                eou is not None
-                and isinstance(eou, (int, float))
-                and llm_ttft is not None
-                and isinstance(llm_ttft, (int, float))
-                and tts_ttfb is not None
-                and isinstance(tts_ttfb, (int, float))
+                started_speaking is not None
+                and isinstance(started_speaking, (int, float))
+                and stopped_speaking is not None
+                and isinstance(stopped_speaking, (int, float))
             ):
-                # Fallback: sum of all three pipeline delays
-                total_latency = float(eou) + float(llm_ttft) + float(tts_ttfb)
-                e2e_source = "computed"
-                self.turn_latencies.append(round(total_latency, 3))
+                measured_latency = float(started_speaking) - float(stopped_speaking)
+
+            # 2. Check for scripted assistant turn (no LLM TTFT, e.g. session.say)
+            has_llm_ttft = llm_ttft is not None and isinstance(llm_ttft, (int, float))
+
+            computed_latency: float | None = None
+            total_latency: float | None = None
+            if not has_llm_ttft:
+                # Scripted turn (closing phrase, short goodbye, error phrase)
+                total_latency = measured_latency
+                e2e_source = "scripted"
             else:
-                total_latency = None
-                e2e_source = "missing"
-                self.missing_latency_turns += 1
+                # 3. Computed pipeline sum: end_of_turn + llm_ttft + tts_ttfb
+                if (
+                    eou is not None
+                    and isinstance(eou, (int, float))
+                    and tts_ttfb is not None
+                    and isinstance(tts_ttfb, (int, float))
+                ):
+                    computed_latency = float(eou) + float(llm_ttft) + float(tts_ttfb)
+
+                # 4. Primary latency selection (measured preferred, computed fallback)
+                if measured_latency is not None:
+                    total_latency = measured_latency
+                    e2e_source = "sdk"
+                elif computed_latency is not None:
+                    total_latency = computed_latency
+                    e2e_source = "computed"
+                else:
+                    total_latency = None
+                    e2e_source = "missing"
+                    self.missing_latency_turns += 1
+
+                if measured_latency is not None:
+                    self.measured_latencies.append(round(measured_latency, 3))
+                if computed_latency is not None:
+                    self.computed_latencies.append(round(computed_latency, 3))
+                if total_latency is not None:
+                    self.turn_latencies.append(round(total_latency, 3))
 
             eou_str = f"{eou:.3f}s" if isinstance(eou, (int, float)) else "N/A"
             stt_str = f"{stt_dur:.3f}s" if isinstance(stt_dur, (int, float)) else "N/A"
@@ -177,16 +210,24 @@ class SessionMetricsCollector:
             tts_str = (
                 f"{tts_ttfb:.3f}s" if isinstance(tts_ttfb, (int, float)) else "N/A"
             )
+            meas_str = (
+                f"{measured_latency:.3f}s" if measured_latency is not None else "N/A"
+            )
+            comp_str = (
+                f"{computed_latency:.3f}s" if computed_latency is not None else "N/A"
+            )
             total_str = f"{total_latency:.3f}s" if total_latency is not None else "N/A"
 
             logger.info(
                 "Turn %d latency: EOU=%s | STT=%s | LLM TTFT=%s | TTS TTFB=%s | "
-                "Total=%s (e2e_source=%s)",
+                "Meas=%s | Comp=%s | Total=%s (e2e_source=%s)",
                 self.turn_index,
                 eou_str,
                 stt_str,
                 llm_str,
                 tts_str,
+                meas_str,
+                comp_str,
                 total_str,
                 e2e_source,
             )
@@ -213,6 +254,12 @@ class SessionMetricsCollector:
                     round(float(tts_ttfb), 3)
                     if isinstance(tts_ttfb, (int, float))
                     else None
+                ),
+                "measured_latency": (
+                    round(measured_latency, 3) if measured_latency is not None else None
+                ),
+                "computed_latency": (
+                    round(computed_latency, 3) if computed_latency is not None else None
                 ),
                 "total_response_latency": (
                     round(total_latency, 3) if total_latency is not None else None
@@ -244,25 +291,48 @@ class SessionMetricsCollector:
     def on_session_close(self) -> dict[str, Any]:
         """Calculates final session latency summary and logs it. Idempotent."""
         try:
+            meas_sum = compute_latency_summary(self.measured_latencies)
+            comp_sum = compute_latency_summary(self.computed_latencies)
+
+            # Primary is measured; fallback to turn_latencies if no measured
+            primary = (
+                meas_sum
+                if self.measured_latencies
+                else compute_latency_summary(self.turn_latencies)
+            )
+
+            summary = {
+                "turns": primary["turns"],
+                "missing_latency_turns": self.missing_latency_turns,
+                "avg": primary["avg"],
+                "p50": primary["p50"],
+                "max": primary["max"],
+                "p50_measured": meas_sum["p50"],
+                "max_measured": meas_sum["max"],
+                "p50_computed": comp_sum["p50"],
+                "max_computed": comp_sum["max"],
+            }
             if self._closed:
-                res = compute_latency_summary(self.turn_latencies)
-                res["missing_latency_turns"] = self.missing_latency_turns
-                return res
+                return summary
             self._closed = True
 
-            summary = compute_latency_summary(self.turn_latencies)
-            summary["missing_latency_turns"] = self.missing_latency_turns
             models = self.models
             logger.info(
                 "Session metrics summary: room=%s, turns=%d, "
                 "missing_latency_turns=%d, avg=%.3fs, p50=%.3fs, "
-                "max=%.3fs | LLM=%s/%s, STT=%s/%s, TTS=%s/%s (voice=%s)",
+                "max=%.3fs (measured p50=%.3fs max=%.3fs | "
+                "computed p50=%.3fs max=%.3fs) | "
+                "LLM=%s/%s, STT=%s/%s, TTS=%s/%s (voice=%s)",
                 self.room_name,
                 summary["turns"],
                 self.missing_latency_turns,
                 summary["avg"],
                 summary["p50"],
                 summary["max"],
+                summary["p50_measured"],
+                summary["max_measured"],
+                summary["p50_computed"],
+                summary["max_computed"],
                 models.llm_provider,
                 models.llm_model,
                 models.stt_provider,
@@ -280,4 +350,8 @@ class SessionMetricsCollector:
                 "avg": 0.0,
                 "p50": 0.0,
                 "max": 0.0,
+                "p50_measured": 0.0,
+                "max_measured": 0.0,
+                "p50_computed": 0.0,
+                "max_computed": 0.0,
             }
