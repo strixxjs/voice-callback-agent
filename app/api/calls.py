@@ -34,7 +34,7 @@ PROJECT_STAGES: tuple[StageOut, ...] = (
     StageOut(id="M0", title="Налаштування", status="done"),
     StageOut(id="M1", title="Агент у браузері", status="done"),
     StageOut(id="M2", title="Код телефонного дзвінка", status="done"),
-    StageOut(id="M3", title="Якість розмови", status="in_progress"),
+    StageOut(id="M3", title="Якість розмови", status="done"),
     StageOut(id="M4", title="Бекенд і консоль", status="done"),
     StageOut(id="M5", title="Резюме і доставка", status="planned"),
     StageOut(id="M6", title="Готовність до демо", status="planned"),
