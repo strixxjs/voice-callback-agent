@@ -229,6 +229,10 @@ def get_stt(language: str) -> Any:
         }
         if api_key:
             kwargs["api_key"] = api_key
+        if model == "nova-3" and settings.stt_keyterms:
+            terms = [k.strip() for k in settings.stt_keyterms.split(",") if k.strip()]
+            if terms:
+                kwargs["keyterm"] = terms
         return deepgram.STT(**kwargs)
     elif provider == "openai":
         from livekit.plugins import openai
@@ -305,6 +309,7 @@ def get_turn_handling() -> TurnHandlingOptions:
         turn_detection=turn_detector,
         interruption={"enabled": True, "mode": interruption_mode},
         endpointing={
+            "mode": settings.endpointing_mode,
             "min_delay": settings.endpointing_min_delay,
             "max_delay": settings.endpointing_max_delay,
         },
@@ -500,6 +505,7 @@ async def entrypoint(ctx: JobContext) -> None:
     script = load_script()
     session_state = SessionState(
         closing_phrase=script.closing_phrase,
+        short_goodbye=script.short_goodbye,
         error_phrase=script.error_phrase,
         phone_mode=phone_mode,
         room_name=ctx.room.name,
