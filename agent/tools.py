@@ -10,10 +10,14 @@ from typing import TYPE_CHECKING, Any
 from livekit.agents import RunContext, StopResponse, function_tool
 from livekit.api import DeleteRoomRequest, TwirpError, TwirpErrorCode
 
+from app.config import settings
+
 if TYPE_CHECKING:
     from livekit.api import LiveKitAPI
 
 logger = logging.getLogger("agent.tools")
+
+LATE_TRANSCRIPT_SETTLE_DELAY: float = 0.3
 
 
 @dataclass
@@ -21,9 +25,12 @@ class SessionState:
     """Mutable session state passed across tool invocations."""
 
     closing_phrase: str = ""
+    short_goodbye: str = ""
     error_phrase: str = ""
     answers: dict[str, Any] = field(default_factory=dict)
     call_ended: bool = False
+    ending_in_progress: bool = False
+    goodbye_count: int = 0
     background_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     phone_mode: bool = False
     room_name: str | None = None
@@ -34,56 +41,114 @@ async def _say_and_disconnect(
     session: Any,
     phrase: str,
     state: SessionState | None = None,
+    allow_interruptions: bool = False,
 ) -> None:
     """Speaks the termination phrase, waits for playout, and closes the RTC session.
 
     In phone mode, room deletion is only executed after speech playout completes
     so speech is never cut off.
+    If the closing phrase is interrupted by caller speech (with transcribed words),
+    session termination is aborted and state.call_ended is reset so the
+    conversation can continue. False interruptions (noise without transcript)
+    do not abort termination.
     """
+    user_spoken_text: list[str] = []
+
+    def _on_transcribed(ev: Any) -> None:
+        if getattr(ev, "is_final", False) is not True:
+            return
+        text = getattr(ev, "transcript", "")
+        if isinstance(text, str) and text.strip():
+            user_spoken_text.append(text.strip())
+
+    if hasattr(session, "on") and callable(session.on):
+        try:
+            session.on("user_input_transcribed", _on_transcribed)
+        except Exception:
+            pass
+
+    interrupted_by_user = False
     try:
         # Yield briefly so any pending events finalize in the runtime
         await asyncio.sleep(0.1)
         if phrase:
             handle = session.say(
                 phrase,
-                allow_interruptions=False,
+                allow_interruptions=allow_interruptions,
             )
             if handle is not None:
                 await handle.wait_for_playout()
+
+            # Check if interrupted by real caller speech
+            if handle is not None and getattr(handle, "interrupted", False) is True:
+                # Wait briefly if user is currently speaking (noise cap)
+                noise_cap = getattr(settings, "end_call_noise_timeout_cap", 3.0)
+                if getattr(session, "user_state", None) == "speaking":
+                    start_wait = asyncio.get_running_loop().time()
+                    while getattr(session, "user_state", None) == "speaking":
+                        if asyncio.get_running_loop().time() - start_wait >= noise_cap:
+                            break
+                        await asyncio.sleep(0.05)
+
+                if LATE_TRANSCRIPT_SETTLE_DELAY > 0:
+                    await asyncio.sleep(LATE_TRANSCRIPT_SETTLE_DELAY)
+
+                if user_spoken_text:
+                    logger.info(
+                        "Closing phrase interrupted by caller speech (%r); "
+                        "continuing session.",
+                        user_spoken_text,
+                    )
+                    interrupted_by_user = True
+                    if state:
+                        state.call_ended = False
+                        state.goodbye_count += 1
+                else:
+                    logger.info(
+                        "Closing phrase interrupted without user transcript "
+                        "(noise); proceeding with disconnect."
+                    )
     except Exception as e:
         logger.warning("Error during speech playout: %s", e)
     finally:
-        await session.aclose()
-        if state and state.phone_mode and state.api and state.room_name:
+        if hasattr(session, "off") and callable(session.off):
             try:
-                await state.api.room.delete_room(
-                    DeleteRoomRequest(room=state.room_name)
+                session.off("user_input_transcribed", _on_transcribed)
+            except Exception:
+                pass
+
+    if interrupted_by_user:
+        return
+
+    await session.aclose()
+    if state and state.phone_mode and state.api and state.room_name:
+        try:
+            await state.api.room.delete_room(DeleteRoomRequest(room=state.room_name))
+            logger.info("Deleted room '%s' to terminate phone call.", state.room_name)
+        except TwirpError as e:
+            if e.code == TwirpErrorCode.NOT_FOUND:
+                logger.debug(
+                    "Room '%s' was already deleted (not found).",
+                    state.room_name,
                 )
-                logger.info(
-                    "Deleted room '%s' to terminate phone call.", state.room_name
+            else:
+                logger.warning(
+                    "Twirp error deleting room '%s': %s",
+                    state.room_name,
+                    e,
                 )
-            except TwirpError as e:
-                if e.code == TwirpErrorCode.NOT_FOUND:
-                    logger.debug(
-                        "Room '%s' was already deleted (not found).",
-                        state.room_name,
-                    )
-                else:
-                    logger.warning(
-                        "Twirp error deleting room '%s': %s",
-                        state.room_name,
-                        e,
-                    )
-            except Exception as e:
-                logger.warning("Error deleting room '%s': %s", state.room_name, e)
+        except Exception as e:
+            logger.warning("Error deleting room '%s': %s", state.room_name, e)
 
 
 def terminate_call(
     session: Any,
     state: SessionState,
     phrase: str,
+    *,
+    allow_interruptions: bool = False,
 ) -> asyncio.Task[None] | None:
-    """Speaks the given phrase without interruption and closes the session.
+    """Speaks the given phrase and closes the session.
 
     Guarantees idempotency (runs only once per session) and retains a strong reference
     to the background task on state.background_tasks so it cannot be garbage-collected.
@@ -92,7 +157,11 @@ def terminate_call(
         return None
     state.call_ended = True
 
-    task = asyncio.create_task(_say_and_disconnect(session, phrase, state))
+    task = asyncio.create_task(
+        _say_and_disconnect(
+            session, phrase, state, allow_interruptions=allow_interruptions
+        )
+    )
     state.background_tasks.add(task)
     task.add_done_callback(state.background_tasks.discard)
     return task
@@ -251,33 +320,107 @@ async def end_call(context: RunContext) -> None:
     session = context.session
     state: SessionState = context.userdata
 
-    # Check if caller is speaking via LiveKit AgentSession.user_state
-    if session.user_state == "speaking":
-        logger.info("end_call invoked while user is speaking; aborting termination.")
+    # Concurrency guard: reject if ending is already in progress
+    if state.ending_in_progress:
+        logger.info("end_call rejected: ending already in progress")
         return None
 
-    # Wait until the agent's current speech generation/playout finishes
+    state.ending_in_progress = True
     try:
-        await context.wait_for_playout()
-    except Exception as e:
-        logger.warning("wait_for_playout in end_call: %s", e)
+        if state.call_ended:
+            logger.info("end_call rejected: call already ended")
+            return None
 
-    # Re-check user state in case caller spoke during playout
-    if session.user_state == "speaking":
-        logger.info("User began speaking during speech playout; aborting termination.")
-        return None
+        # Check if caller is speaking via LiveKit AgentSession.user_state
+        if getattr(session, "user_state", None) == "speaking":
+            logger.info(
+                "end_call invoked while user is speaking; aborting termination."
+            )
+            return None
 
-    # Guard: do not end call if agent just asked a question awaiting user's answer
-    current_text = _extract_speech_text(getattr(context, "speech_handle", None))
-    history_messages = _extract_history_messages(getattr(session, "history", None))
+        # Step 1: Wait until the agent's current speech generation/playout finishes
+        try:
+            await context.wait_for_playout()
+        except Exception as e:
+            logger.warning("wait_for_playout in end_call: %s", e)
 
-    if has_pending_agent_question(
-        messages=history_messages,
-        current_generation_text=current_text,
-    ):
-        logger.warning("end_call rejected: pending question")
-        return None
+        # Re-check user state in case caller spoke during playout
+        if getattr(session, "user_state", None) == "speaking":
+            logger.info(
+                "User began speaking during speech playout; aborting termination."
+            )
+            return None
 
-    logger.info("end_call tool triggered, closing call session.")
-    terminate_call(session, state, phrase=state.closing_phrase)
-    raise StopResponse()
+        # Step 2: Guard: do not end call if agent just asked a question
+        # awaiting user's answer
+        current_text = _extract_speech_text(getattr(context, "speech_handle", None))
+        history_messages = _extract_history_messages(getattr(session, "history", None))
+
+        if has_pending_agent_question(
+            messages=history_messages,
+            current_generation_text=current_text,
+        ):
+            logger.warning("end_call rejected: pending question")
+            return None
+
+        # Step 3: Grace period with noise filter
+        grace_period = getattr(settings, "end_call_grace_period", 0.0)
+        if grace_period > 0.0:
+            user_spoken_text: list[str] = []
+
+            def _on_transcribed(ev: Any) -> None:
+                if getattr(ev, "is_final", False) is not True:
+                    return
+                text = getattr(ev, "transcript", "")
+                if isinstance(text, str) and text.strip():
+                    user_spoken_text.append(text.strip())
+
+            if hasattr(session, "on") and callable(session.on):
+                try:
+                    session.on("user_input_transcribed", _on_transcribed)
+                except Exception:
+                    pass
+
+            try:
+                await asyncio.sleep(grace_period)
+
+                noise_cap = getattr(settings, "end_call_noise_timeout_cap", 3.0)
+                if getattr(session, "user_state", None) == "speaking":
+                    start_wait = asyncio.get_running_loop().time()
+                    while getattr(session, "user_state", None) == "speaking":
+                        if asyncio.get_running_loop().time() - start_wait >= noise_cap:
+                            logger.info(
+                                "Grace window: user_state speaking reached "
+                                "noise cap (%ss)",
+                                noise_cap,
+                            )
+                            break
+                        await asyncio.sleep(0.05)
+
+                if LATE_TRANSCRIPT_SETTLE_DELAY > 0:
+                    await asyncio.sleep(LATE_TRANSCRIPT_SETTLE_DELAY)
+            finally:
+                if hasattr(session, "off") and callable(session.off):
+                    try:
+                        session.off("user_input_transcribed", _on_transcribed)
+                    except Exception:
+                        pass
+
+            if user_spoken_text:
+                logger.info(
+                    "end_call aborted: user spoke during grace period (%r)",
+                    user_spoken_text,
+                )
+                return None
+
+        # Step 4: Choose closing phrase and terminate
+        phrase = (
+            state.short_goodbye
+            if state.goodbye_count > 0 and state.short_goodbye
+            else state.closing_phrase
+        )
+        logger.info("end_call tool triggered, closing call session.")
+        terminate_call(session, state, phrase=phrase, allow_interruptions=True)
+        raise StopResponse()
+    finally:
+        state.ending_in_progress = False

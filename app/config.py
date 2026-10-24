@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     stt_model: str | None = None
     # Optional STT language override; if None, language from script.yaml is used
     stt_language: str | None = None
+    stt_keyterms: str | None = None
     deepgram_api_key: str | None = None
 
     tts_provider: str = "elevenlabs"
@@ -62,9 +63,13 @@ class Settings(BaseSettings):
     turn_detection_mode: str = "vad"
     # "vad" (local Silero, free) or "adaptive" (cloud inference)
     interruption_mode: str = "vad"
-    endpointing_min_delay: float = 0.5
+    # "fixed" or "dynamic"
+    endpointing_mode: str = "fixed"
+    endpointing_min_delay: float = 1.0
     endpointing_max_delay: float = 3.0
     preemptive_generation: bool = True
+    end_call_grace_period: float = 1.2
+    end_call_noise_timeout_cap: float = 3.0
 
     # Delivery
     telegram_bot_token: str | None = None

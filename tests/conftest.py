@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import (
 
 import agent.extraction
 import agent.reporting
+import agent.tools
 import agent.worker
 import app.api.calls
 import app.api.internal
@@ -31,8 +32,11 @@ from app.models import Base
 def isolate_env(monkeypatch: pytest.MonkeyPatch) -> Settings:
     """Provides isolated test settings without reading local .env, matching CI."""
     clean_settings = Settings(_env_file=None)
+    clean_settings.end_call_grace_period = 0.0
     monkeypatch.setattr(app.config, "settings", clean_settings)
     monkeypatch.setattr(agent.worker, "settings", clean_settings)
+    monkeypatch.setattr(agent.tools, "settings", clean_settings)
+    monkeypatch.setattr(agent.tools, "LATE_TRANSCRIPT_SETTLE_DELAY", 0.0)
     monkeypatch.setattr(agent.extraction, "settings", clean_settings)
     monkeypatch.setattr(agent.reporting, "settings", clean_settings)
     monkeypatch.setattr(app.api.internal, "settings", clean_settings)
@@ -44,7 +48,14 @@ def isolate_env(monkeypatch: pytest.MonkeyPatch) -> Settings:
         import scripts.call_me
 
         monkeypatch.setattr(scripts.call_me, "settings", clean_settings)
-    except ImportError:
+    except (ImportError, AttributeError):
+        pass
+    try:
+        import scripts.eval_call
+
+        if hasattr(scripts.eval_call, "settings"):
+            monkeypatch.setattr(scripts.eval_call, "settings", clean_settings)
+    except (ImportError, AttributeError):
         pass
     return clean_settings
 

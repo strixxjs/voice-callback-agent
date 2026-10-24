@@ -10,6 +10,9 @@ greeting: "Доброго дня! Це Саня, ШІ-асистентка Solar
 # Closing phrase spoken when the call wraps up
 closing_phrase: "Дякую за розмову! Менеджер зв'яжеться з вами найближчим часом. Гарного дня та до побачення!"
 
+# Short goodbye phrase spoken on subsequent or interrupted end-call attempts
+short_goodbye: "До побачення!"
+
 # Fixed error phrase spoken if LLM fails after all retries and fallbacks
 error_phrase: "Перепрошую, у нас виникла технічна помилка. Наш менеджер обов'язково зателефонує вам найближчим часом. До побачення!"
 
