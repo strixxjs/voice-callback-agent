@@ -555,6 +555,24 @@ async def entrypoint(ctx: JobContext) -> None:
         room_name=ctx.room.name,
         models=active_models,
     )
+    call_config = {
+        "llm_provider": active_models.llm_provider,
+        "llm_model": active_models.llm_model,
+        "llm_fallback_model": settings.llm_fallback_model,
+        "stt_provider": active_models.stt_provider,
+        "stt_model": active_models.stt_model,
+        "stt_language": stt_language,
+        "tts_provider": active_models.tts_provider,
+        "tts_model": active_models.tts_model,
+        "tts_voice_id": active_models.tts_voice_id,
+        "endpointing_mode": settings.endpointing_mode,
+        "endpointing_min_delay": settings.endpointing_min_delay,
+        "endpointing_max_delay": settings.endpointing_max_delay,
+        "end_call_grace_period": settings.end_call_grace_period,
+        "turn_detection_mode": settings.turn_detection_mode,
+        "interruption_mode": settings.interruption_mode,
+        "preemptive_generation": settings.preemptive_generation,
+    }
     metrics_collector.attach_to_session(session)
 
     agent = VoiceCallbackAgent(script)
@@ -638,6 +656,12 @@ async def entrypoint(ctx: JobContext) -> None:
         nonlocal turn_counter
         item = getattr(event, "item", None)
         if isinstance(item, llm.ChatMessage):
+            turn_metrics = None
+            try:
+                turn_metrics = metrics_collector.process_chat_message(item)
+            except Exception as e:
+                logger.warning("Error computing metrics for turn: %s", e)
+
             role_val = str(
                 item.role.value if hasattr(item.role, "value") else item.role
             ).lower()
@@ -648,10 +672,12 @@ async def entrypoint(ctx: JobContext) -> None:
                     mapped_role = (
                         "agent" if role_val in ("assistant", "agent") else "user"
                     )
+                    metrics_to_report = turn_metrics if mapped_role == "agent" else None
                     reporter.report_turn(
                         role=mapped_role,
                         content=text,
                         turn_index=turn_counter,
+                        metrics=metrics_to_report,
                     )
 
     @session.on("error")
@@ -728,6 +754,7 @@ async def entrypoint(ctx: JobContext) -> None:
             reporter.report_event(
                 "call_answered",
                 f"Call answered by {mask_phone_number(phone_number)}",
+                {"call_config": call_config},
             )
             logger.info(
                 "Call answered by %s (participant identity: %s)",
@@ -812,7 +839,11 @@ async def entrypoint(ctx: JobContext) -> None:
                 f"Participant joined: identity={participant.identity}, "
                 f"name={participant.name}"
             ),
-            {"identity": participant.identity, "name": participant.name},
+            {
+                "identity": participant.identity,
+                "name": participant.name,
+                "call_config": call_config,
+            },
         )
 
         room_options = RoomOptions(

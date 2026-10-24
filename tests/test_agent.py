@@ -2044,3 +2044,48 @@ def test_eval_call_agent_role_and_extraction_edge_cases() -> None:
     # missing: f2, f6 (f1 and f5 are already in answered so not double counted) -> 2
     # total = 2 + 2 = 4 -> "2/4"
     assert format_extraction_status(call_overlap) == "2/4"
+
+
+@pytest.mark.asyncio
+async def test_entrypoint_call_config_takes_modes_from_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies that call_config records modes from settings."""
+    from agent.worker import entrypoint
+
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
+    monkeypatch.setattr(settings, "deepgram_api_key", "test-key")
+    monkeypatch.setattr(settings, "elevenlabs_api_key", "test-key")
+    monkeypatch.setattr(settings, "turn_detection_mode", "turn_detector")
+    monkeypatch.setattr(settings, "interruption_mode", "stt")
+
+    mock_reporter = MagicMock()
+    mock_reporter.is_noop = False
+    mock_reporter.aclose = AsyncMock()
+    monkeypatch.setattr("agent.worker.CallReporter", lambda **kw: mock_reporter)
+
+    mock_ctx = MagicMock()
+    mock_ctx.job.metadata = json.dumps({"call_id": "test-call-config-modes"})
+    mock_ctx.room.name = "test-config-room"
+    mock_ctx.connect = AsyncMock()
+
+    mock_participant = MagicMock()
+    mock_participant.identity = "user-1"
+    mock_participant.name = "Alice"
+    mock_ctx.wait_for_participant = AsyncMock(return_value=mock_participant)
+
+    with (
+        patch("agent.worker.AgentSession.start", new_callable=AsyncMock),
+        patch("agent.worker.AgentSession.say", new_callable=AsyncMock),
+    ):
+        await entrypoint(mock_ctx)
+
+    joined_calls = [
+        c
+        for c in mock_reporter.report_event.call_args_list
+        if c[0][0] == "participant_joined"
+    ]
+    assert len(joined_calls) == 1
+    call_config = joined_calls[0][0][2]["call_config"]
+    assert call_config["turn_detection_mode"] == "turn_detector"
+    assert call_config["interruption_mode"] == "stt"
