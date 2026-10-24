@@ -98,94 +98,212 @@ class SessionMetricsCollector:
         self.measured_latencies: list[float] = []
         self.computed_latencies: list[float] = []
         self._last_user_metrics: dict[str, Any] | None = None
+        self._user_anchor: float | None = None
+        self._any_user_had_stop_time: bool = False
         self._closed = False
 
     def attach_to_session(self, session: AgentSession) -> None:
-        """Subscribes to session conversation items without deprecated events."""
-        try:
-            session.on("conversation_item_added", self._on_conversation_item_added)
-        except Exception as e:
-            logger.warning("Failed to attach metrics listener to session: %s", e)
+        """Stores session reference; metrics are processed via worker reporting."""
+        self._session = session
 
     def _on_conversation_item_added(self, event: ConversationItemAddedEvent) -> None:
         """Processes conversation items, pairing user metrics with assistant replies."""
         try:
             item = getattr(event, "item", None)
-            if not isinstance(item, llm.ChatMessage):
-                return
+            self.process_chat_message(item)
+        except Exception as e:
+            logger.warning("Metrics collector error handling conversation item: %s", e)
 
-            if item.role == "user":
+    def process_chat_message(self, item: Any) -> dict[str, Any] | None:
+        """Processes a ChatMessage; returns turn metrics for assistant turns."""
+        try:
+            if not isinstance(item, llm.ChatMessage):
+                return None
+
+            role_val = str(
+                item.role.value if hasattr(item.role, "value") else item.role
+            ).lower()
+
+            if role_val == "user":
                 raw_metrics = getattr(item, "metrics", {}) or {}
                 if self._last_user_metrics is None:
                     self._last_user_metrics = {}
                 for k, v in raw_metrics.items():
                     if v is not None and v != "":
-                        current_val = self._last_user_metrics.get(k)
-                        if current_val is None or current_val == "":
-                            self._last_user_metrics[k] = v
-            elif item.role == "assistant":
-                user_metrics = self._last_user_metrics
-                self._last_user_metrics = None
+                        self._last_user_metrics[k] = v
 
-                # Skip assistant messages not answering user speech (e.g. greeting)
-                if user_metrics is None:
-                    return
+                # Track anchor separately from merged metrics:
+                # anchor = numeric stopped_speaking_at of the LAST user message
+                # since previous assistant message, else None.
+                # Also remember whether ANY user message in that span had a stop time.
+                val = raw_metrics.get("stopped_speaking_at")
+                if val is not None and isinstance(val, (int, float)):
+                    self._user_anchor = float(val)
+                    self._any_user_had_stop_time = True
+                else:
+                    self._user_anchor = None
+                return None
+
+            if role_val in ("assistant", "agent"):
+                user_metrics = self._last_user_metrics
+                anchor = self._user_anchor
+                any_user_had_stop_time = self._any_user_had_stop_time
+
+                self._last_user_metrics = None
+                self._user_anchor = None
+                self._any_user_had_stop_time = False
 
                 raw_assistant_metrics = getattr(item, "metrics", {}) or {}
-                self._record_turn(user_metrics, dict(raw_assistant_metrics))
+                return self._record_turn(
+                    user_metrics,
+                    dict(raw_assistant_metrics),
+                    anchor=anchor,
+                    any_user_had_stop_time=any_user_had_stop_time,
+                )
+
+            return None
         except Exception as e:
-            logger.warning("Metrics collector error handling conversation item: %s", e)
+            logger.warning("Metrics collector error processing chat message: %s", e)
+            return None
 
     def _record_turn(
-        self, user_metrics: dict[str, Any], assistant_metrics: dict[str, Any]
-    ) -> None:
-        """Extracts latency fields, logs one summary line, and writes JSONL."""
+        self,
+        user_metrics: dict[str, Any] | None,
+        assistant_metrics: dict[str, Any],
+        *,
+        anchor: float | None = None,
+        any_user_had_stop_time: bool = False,
+    ) -> dict[str, Any]:
+        """Extracts latency fields, logs summary, writes JSONL, returns metrics."""
         try:
+            # Fallback if _record_turn is invoked directly without anchor kwargs
+            if anchor is None and not any_user_had_stop_time and user_metrics:
+                raw_stop = user_metrics.get("stopped_speaking_at")
+                if raw_stop is not None and isinstance(raw_stop, (int, float)):
+                    anchor = float(raw_stop)
+                    any_user_had_stop_time = True
+
+            llm_ttft = assistant_metrics.get("llm_node_ttft")
+            has_llm_ttft = llm_ttft is not None and isinstance(llm_ttft, (int, float))
+
+            if user_metrics is None and not has_llm_ttft:
+                # Scripted turn without prior user speech (e.g. greeting)
+                tts_ttfb = assistant_metrics.get("tts_node_ttfb")
+                return {
+                    "e2e": None,
+                    "e2e_source": "scripted",
+                    "sdk_e2e": None,
+                    "scripted": True,
+                    "endpointing_delay": None,
+                    "transcript_delay": None,
+                    "llm_ttft": None,
+                    "tts_ttfb": (
+                        round(float(tts_ttfb), 3)
+                        if tts_ttfb is not None and isinstance(tts_ttfb, (int, float))
+                        else None
+                    ),
+                    "llm_model": None,
+                    "llm_fallback": False,
+                }
+
+            has_prior_user = user_metrics is not None
+            if user_metrics is None:
+                user_metrics = {}
+
             self.turn_index += 1
 
             eou = user_metrics.get("end_of_turn_delay")
             stt_dur = user_metrics.get("transcription_delay")
-            llm_ttft = assistant_metrics.get("llm_node_ttft")
             tts_ttfb = assistant_metrics.get("tts_node_ttfb")
-            raw_total = assistant_metrics.get("e2e_latency")
+            raw_sdk_e2e = assistant_metrics.get("e2e_latency")
             started_speaking = assistant_metrics.get("started_speaking_at")
-            stopped_speaking = user_metrics.get("stopped_speaking_at")
 
-            # 1. Measured end-to-end latency: time from user stopping speaking
-            # to agent audio playback starting.
-            measured_latency: float | None = None
-            if raw_total is not None and isinstance(raw_total, (int, float)):
-                measured_latency = float(raw_total)
-            elif (
+            # Measured end-to-end diff: assistant started - last user stopped
+            diff_measured: float | None = None
+            if (
                 started_speaking is not None
                 and isinstance(started_speaking, (int, float))
-                and stopped_speaking is not None
-                and isinstance(stopped_speaking, (int, float))
+                and anchor is not None
+                and isinstance(anchor, (int, float))
             ):
-                measured_latency = float(started_speaking) - float(stopped_speaking)
+                diff_measured = float(started_speaking) - float(anchor)
 
-            # 2. Check for scripted assistant turn (no LLM TTFT, e.g. session.say)
-            has_llm_ttft = llm_ttft is not None and isinstance(llm_ttft, (int, float))
+            sdk_e2e_val: float | None = None
+            if raw_sdk_e2e is not None and isinstance(raw_sdk_e2e, (int, float)):
+                sdk_e2e_val = float(raw_sdk_e2e)
+
+            # Check for scripted assistant turn (no LLM TTFT, e.g. session.say)
+            is_scripted = not has_llm_ttft
+
+            # Log correction when both exist and differ by > 0.3s
+            if (
+                sdk_e2e_val is not None
+                and diff_measured is not None
+                and abs(sdk_e2e_val - diff_measured) > 0.3
+            ):
+                logger.info(
+                    "e2e anchor corrected: sdk=%.3f measured=%.3f (turn %d)",
+                    sdk_e2e_val,
+                    diff_measured,
+                    self.turn_index,
+                )
 
             computed_latency: float | None = None
-            total_latency: float | None = None
-            if not has_llm_ttft:
-                # Scripted turn (closing phrase, short goodbye, error phrase)
-                total_latency = measured_latency
-                e2e_source = "scripted"
-            else:
-                # 3. Computed pipeline sum: end_of_turn + llm_ttft + tts_ttfb
-                if (
-                    eou is not None
-                    and isinstance(eou, (int, float))
-                    and tts_ttfb is not None
-                    and isinstance(tts_ttfb, (int, float))
-                ):
-                    computed_latency = float(eou) + float(llm_ttft) + float(tts_ttfb)
+            if (
+                eou is not None
+                and isinstance(eou, (int, float))
+                and llm_ttft is not None
+                and isinstance(llm_ttft, (int, float))
+                and tts_ttfb is not None
+                and isinstance(tts_ttfb, (int, float))
+            ):
+                computed_latency = float(eou) + float(llm_ttft) + float(tts_ttfb)
 
-                # 4. Primary latency selection (measured preferred, computed fallback)
-                if measured_latency is not None:
-                    total_latency = measured_latency
+            total_latency: float | None = None
+
+            if is_scripted:
+                # Scripted turns: same anchor rule; if anchor is missing -> e2e null
+                e2e_source = "scripted"
+                total_latency = diff_measured
+            elif not has_prior_user:
+                # LLM turn with no preceding user metrics (e.g. LLM greeting)
+                total_latency = None
+                e2e_source = "missing"
+                self.missing_latency_turns += 1
+            elif anchor is not None:
+                # Anchor present: started_speaking_at - anchor, source "measured"
+                if diff_measured is not None:
+                    total_latency = diff_measured
+                    e2e_source = "measured"
+                elif sdk_e2e_val is not None:
+                    total_latency = sdk_e2e_val
+                    e2e_source = "sdk"
+                elif computed_latency is not None:
+                    total_latency = computed_latency
+                    e2e_source = "computed"
+                else:
+                    total_latency = None
+                    e2e_source = "missing"
+                    self.missing_latency_turns += 1
+            elif any_user_had_stop_time:
+                # Anchor missing but earlier segment in span had stop time (split turn):
+                # computed if available, else missing. Do NOT use SDK value here.
+                if computed_latency is not None:
+                    total_latency = computed_latency
+                    e2e_source = "computed"
+                    logger.info(
+                        "e2e anchor unavailable: last user segment has no stop time "
+                        "(turn %d), using computed",
+                        self.turn_index,
+                    )
+                else:
+                    total_latency = None
+                    e2e_source = "missing"
+                    self.missing_latency_turns += 1
+            else:
+                # No stop time in span: current behavior (SDK, then computed, missing)
+                if sdk_e2e_val is not None:
+                    total_latency = sdk_e2e_val
                     e2e_source = "sdk"
                 elif computed_latency is not None:
                     total_latency = computed_latency
@@ -195,13 +313,34 @@ class SessionMetricsCollector:
                     e2e_source = "missing"
                     self.missing_latency_turns += 1
 
-                if measured_latency is not None:
-                    self.measured_latencies.append(round(measured_latency, 3))
+            if not is_scripted:
+                if total_latency is not None and e2e_source in ("measured", "sdk"):
+                    self.measured_latencies.append(round(total_latency, 3))
                 if computed_latency is not None:
                     self.computed_latencies.append(round(computed_latency, 3))
                 if total_latency is not None:
                     self.turn_latencies.append(round(total_latency, 3))
 
+            llm_model: str | None = None
+            llm_fallback = False
+            if not is_scripted:
+                llm_meta = assistant_metrics.get("llm_metadata")
+                if isinstance(llm_meta, dict):
+                    llm_model = llm_meta.get("model_name")
+                elif hasattr(llm_meta, "model_name"):
+                    llm_model = llm_meta.model_name
+                llm_fallback = bool(llm_model and llm_model != self.models.llm_model)
+
+            meas_val = (
+                diff_measured
+                if diff_measured is not None
+                else (sdk_e2e_val if e2e_source == "sdk" else None)
+            )
+            meas_str = f"{meas_val:.3f}s" if meas_val is not None else "N/A"
+            comp_str = (
+                f"{computed_latency:.3f}s" if computed_latency is not None else "N/A"
+            )
+            total_str = f"{total_latency:.3f}s" if total_latency is not None else "N/A"
             eou_str = f"{eou:.3f}s" if isinstance(eou, (int, float)) else "N/A"
             stt_str = f"{stt_dur:.3f}s" if isinstance(stt_dur, (int, float)) else "N/A"
             llm_str = (
@@ -210,13 +349,6 @@ class SessionMetricsCollector:
             tts_str = (
                 f"{tts_ttfb:.3f}s" if isinstance(tts_ttfb, (int, float)) else "N/A"
             )
-            meas_str = (
-                f"{measured_latency:.3f}s" if measured_latency is not None else "N/A"
-            )
-            comp_str = (
-                f"{computed_latency:.3f}s" if computed_latency is not None else "N/A"
-            )
-            total_str = f"{total_latency:.3f}s" if total_latency is not None else "N/A"
 
             logger.info(
                 "Turn %d latency: EOU=%s | STT=%s | LLM TTFT=%s | TTS TTFB=%s | "
@@ -256,7 +388,10 @@ class SessionMetricsCollector:
                     else None
                 ),
                 "measured_latency": (
-                    round(measured_latency, 3) if measured_latency is not None else None
+                    round(meas_val, 3) if meas_val is not None else None
+                ),
+                "sdk_e2e_latency": (
+                    round(sdk_e2e_val, 3) if sdk_e2e_val is not None else None
                 ),
                 "computed_latency": (
                     round(computed_latency, 3) if computed_latency is not None else None
@@ -274,10 +409,49 @@ class SessionMetricsCollector:
                 "tts_voice_id": models.tts_voice_id,
             }
             self._write_jsonl_record(record)
+
+            return {
+                "e2e": round(total_latency, 3) if total_latency is not None else None,
+                "e2e_source": e2e_source,
+                "sdk_e2e": round(sdk_e2e_val, 3) if sdk_e2e_val is not None else None,
+                "scripted": is_scripted,
+                "endpointing_delay": (
+                    round(float(eou), 3) if isinstance(eou, (int, float)) else None
+                ),
+                "transcript_delay": (
+                    round(float(stt_dur), 3)
+                    if isinstance(stt_dur, (int, float))
+                    else None
+                ),
+                "llm_ttft": (
+                    round(float(llm_ttft), 3)
+                    if isinstance(llm_ttft, (int, float))
+                    else None
+                ),
+                "tts_ttfb": (
+                    round(float(tts_ttfb), 3)
+                    if isinstance(tts_ttfb, (int, float))
+                    else None
+                ),
+                "llm_model": llm_model,
+                "llm_fallback": llm_fallback,
+            }
         except Exception as e:
             logger.warning(
                 "Error recording turn %d metrics: %s", self.turn_index, e, exc_info=True
             )
+            return {
+                "e2e": None,
+                "e2e_source": "missing",
+                "sdk_e2e": None,
+                "scripted": False,
+                "endpointing_delay": None,
+                "transcript_delay": None,
+                "llm_ttft": None,
+                "tts_ttfb": None,
+                "llm_model": None,
+                "llm_fallback": False,
+            }
 
     def _write_jsonl_record(self, record: dict[str, Any]) -> None:
         """Appends turn record to JSONL file safely."""
