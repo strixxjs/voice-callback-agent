@@ -808,3 +808,127 @@ h1, h2, h3, h4 {
   padding: 40px 20px;
   font-size: 13px;
 }
+
+/* Latency metrics & Call Config UI */
+.latency-badge-btn {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--surface-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 3px 8px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  line-height: 1.4;
+  transition: all 0.15s ease;
+}
+
+.latency-badge-btn:hover,
+.latency-badge-btn:focus-visible {
+  border-color: var(--accent);
+  color: var(--text);
+  background: var(--surface-hover);
+  outline: none;
+}
+
+.latency-badge-btn[aria-expanded="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-subtle);
+}
+
+.detail-latency-panel {
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: var(--surface-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  line-height: 1.6;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.latency-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.latency-row-label {
+  color: var(--muted);
+  font-weight: 500;
+  min-width: 74px;
+}
+
+.latency-row-val {
+  color: var(--text);
+  font-family: var(--font-body);
+}
+
+.latency-hint {
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--faint);
+  line-height: 1.4;
+  border-top: 1px dashed var(--border);
+  padding-top: 6px;
+}
+
+.turn-latency-btn {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+  cursor: pointer;
+  line-height: 1.3;
+  margin-left: 8px;
+  transition: all 0.15s ease;
+}
+
+.turn-latency-btn:hover,
+.turn-latency-btn:focus-visible {
+  color: var(--text);
+  border-color: var(--muted);
+  background: rgba(255, 255, 255, 0.1);
+  outline: none;
+}
+
+.turn-latency-btn[aria-expanded="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+}
+
+.turn-latency-panel {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+
+.faint {
+  color: var(--faint);
+  font-size: 11px;
+}
+

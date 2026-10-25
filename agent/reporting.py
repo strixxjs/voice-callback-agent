@@ -182,19 +182,23 @@ class CallReporter:
         role: str,
         content: str,
         turn_index: int,
+        metrics: dict[str, Any] | None = None,
     ) -> None:
         """Enqueues a conversational turn with worker-assigned turn_index."""
         if self.is_noop:
             return
+        payload: dict[str, Any] = {
+            "turn_index": turn_index,
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
+        if metrics is not None:
+            payload["metrics"] = metrics
         self._enqueue(
             "POST",
             f"/internal/calls/{self.call_id}/turn",
-            {
-                "turn_index": turn_index,
-                "role": role,
-                "content": content,
-                "timestamp": datetime.now(UTC).isoformat(),
-            },
+            payload,
         )
 
     def report_ended(
@@ -206,15 +210,16 @@ class CallReporter:
         """Enqueues call ended status before extraction."""
         if self.is_noop:
             return
+        payload: dict[str, Any] = {
+            "status": status,
+            "ended_at": datetime.now(UTC).isoformat(),
+            "duration_seconds": duration_seconds,
+            "latency_summary": latency_summary,
+        }
         self._enqueue(
             "POST",
             f"/internal/calls/{self.call_id}/ended",
-            {
-                "status": status,
-                "ended_at": datetime.now(UTC).isoformat(),
-                "duration_seconds": duration_seconds,
-                "latency_summary": latency_summary,
-            },
+            payload,
         )
 
     def report_extraction(

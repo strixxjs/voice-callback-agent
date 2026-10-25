@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.live import broadcaster
 from app.models import Call, CallEvent, CallTurn
 
 
@@ -236,3 +237,147 @@ async def test_record_call_ended_and_extraction(
     assert sample_call.extraction_status == "ok"
     assert sample_call.extracted_answers["name"] == "Jane"
     assert sample_call.extracted_missing == []
+
+
+@pytest.mark.asyncio
+async def test_internal_endpoint_stores_turn_metrics_and_call_config(
+    async_client: httpx.AsyncClient,
+    sample_call: Call,
+    db_session: AsyncSession,
+) -> None:
+    """Verifies that internal endpoints store turn metrics and call_config."""
+    headers = {"X-Internal-Secret": settings.internal_api_secret}
+
+    # 1. Store call_config via event moving call to in_progress
+    config_payload = {
+        "llm_provider": "google",
+        "llm_model": "gemini-3.5-flash-lite",
+        "stt_provider": "deepgram",
+        "stt_model": "nova-3",
+    }
+    resp_event = await async_client.post(
+        f"/internal/calls/{sample_call.id}/event",
+        headers=headers,
+        json={
+            "event_type": "participant_joined",
+            "message": "User connected",
+            "payload": {
+                "identity": "user-123",
+                "call_config": config_payload,
+            },
+        },
+    )
+    assert resp_event.status_code == 200
+    await db_session.refresh(sample_call)
+    assert sample_call.status == "in_progress"
+    assert sample_call.call_config == config_payload
+
+    # Verify event payload in DB does not keep call_config
+    events = (
+        await db_session.scalars(
+            select(CallEvent).where(
+                CallEvent.call_id == sample_call.id,
+                CallEvent.event_type == "participant_joined",
+            )
+        )
+    ).all()
+    assert len(events) == 1
+    assert events[0].payload == {"identity": "user-123"}
+
+    # 2. Store turn metrics via /turn
+    metrics_payload = {
+        "e2e": 1.152,
+        "e2e_source": "measured",
+        "sdk_e2e": 1.152,
+        "scripted": False,
+        "endpointing_delay": 0.52,
+        "transcript_delay": 0.25,
+        "llm_ttft": 0.32,
+        "tts_ttfb": 0.21,
+        "llm_model": "gemini-3.5-flash-lite",
+        "llm_fallback": False,
+    }
+    resp_turn = await async_client.post(
+        f"/internal/calls/{sample_call.id}/turn",
+        headers=headers,
+        json={
+            "turn_index": 1,
+            "role": "agent",
+            "content": "Доброго дня!",
+            "metrics": metrics_payload,
+        },
+    )
+    assert resp_turn.status_code == 200
+
+    turns = (
+        await db_session.scalars(
+            select(CallTurn).where(CallTurn.call_id == sample_call.id)
+        )
+    ).all()
+    assert len(turns) == 1
+    assert turns[0].turn_index == 1
+    assert turns[0].metrics == metrics_payload
+
+
+@pytest.mark.asyncio
+async def test_record_call_event_call_config_when_status_unchanged_no_status_sse(
+    async_client: httpx.AsyncClient,
+    sample_call: Call,
+    db_session: AsyncSession,
+) -> None:
+    """Verifies that when call is already in_progress, an event with call_config
+    updates call.call_config without calling update_call_status (no status SSE event).
+    """
+    headers = {"X-Internal-Secret": settings.internal_api_secret}
+
+    # Move call to in_progress first
+    sample_call.status = "in_progress"
+    sample_call.call_config = {"initial": "config"}
+    await db_session.commit()
+
+    queue = broadcaster.subscribe()
+    try:
+        updated_config = {
+            "llm_provider": "google",
+            "llm_model": "gemini-2.5-flash",
+            "turn_detection_mode": "vad",
+        }
+        resp = await async_client.post(
+            f"/internal/calls/{sample_call.id}/event",
+            headers=headers,
+            json={
+                "event_type": "diagnostic_event",
+                "message": "Routine health event",
+                "payload": {
+                    "reason": "periodic_check",
+                    "call_config": updated_config,
+                },
+            },
+        )
+        assert resp.status_code == 200
+
+        await db_session.refresh(sample_call)
+        assert sample_call.status == "in_progress"
+        assert sample_call.call_config == updated_config
+
+        # Check DB event payload does not include call_config
+        events = (
+            await db_session.scalars(
+                select(CallEvent).where(
+                    CallEvent.call_id == sample_call.id,
+                    CallEvent.event_type == "diagnostic_event",
+                )
+            )
+        ).all()
+        assert len(events) == 1
+        assert events[0].payload == {"reason": "periodic_check"}
+
+        # Drain broadcaster events: only 'event' kind must be emitted, NO 'status' kind
+        kinds = []
+        while not queue.empty():
+            msg = queue.get_nowait()
+            kinds.append(msg.get("kind"))
+        assert "event" in kinds
+        assert "status" not in kinds
+    finally:
+        broadcaster.unsubscribe(queue)

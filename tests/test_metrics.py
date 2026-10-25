@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from livekit.agents import llm
 from livekit.agents.voice.events import ConversationItemAddedEvent
 
@@ -22,6 +23,7 @@ from agent.worker import (
     resolve_tts_voice,
 )
 from app.config import Settings
+from app.services.calls import compute_call_latency_summary
 
 
 def _create_test_models() -> ActiveModels:
@@ -463,13 +465,15 @@ def test_metrics_measured_and_computed_latency(tmp_path: Path) -> None:
 
     rec1 = json.loads(lines[0])
     assert rec1["measured_latency"] == 0.850
+    assert rec1["sdk_e2e_latency"] == 0.850
     assert rec1["computed_latency"] == 1.000
-    assert rec1["e2e_source"] == "sdk"
+    assert rec1["e2e_source"] == "measured"
 
     rec2 = json.loads(lines[1])
     assert rec2["measured_latency"] == 1.150
+    assert rec2["sdk_e2e_latency"] is None
     assert rec2["computed_latency"] == 1.090
-    assert rec2["e2e_source"] == "sdk"
+    assert rec2["e2e_source"] == "measured"
 
     rec3 = json.loads(lines[2])
     assert rec3["measured_latency"] is None
@@ -566,3 +570,303 @@ def test_metrics_scripted_turn_excluded_from_latencies(tmp_path: Path) -> None:
     assert rec3["llm_ttft"] is None
     assert rec3["measured_latency"] == 2.500
     assert rec3["computed_latency"] is None
+
+
+def test_session_metrics_collector_merge_last_wins(tmp_path: Path) -> None:
+    """Verifies that subsequent non-empty user metrics overwrite earlier ones,
+    but None/'' does not overwrite existing values.
+    """
+    collector = SessionMetricsCollector(
+        room_name="test-room-merge",
+        models=_create_test_models(),
+        log_dir=tmp_path,
+    )
+
+    user_msg_1 = llm.ChatMessage(role="user", content=["Перша фраза"])
+    user_msg_1.metrics = {
+        "stopped_speaking_at": 100.0,
+        "end_of_turn_delay": 0.500,
+        "speech_start_time": 95.0,
+    }
+    collector.process_chat_message(user_msg_1)
+
+    user_msg_2 = llm.ChatMessage(role="user", content=["Друга фраза"])
+    user_msg_2.metrics = {
+        "stopped_speaking_at": 103.0,
+        "end_of_turn_delay": 0.600,
+        "speech_start_time": None,  # None must not overwrite 95.0
+    }
+    collector.process_chat_message(user_msg_2)
+
+    assert collector._last_user_metrics is not None
+    assert collector._last_user_metrics["stopped_speaking_at"] == 103.0
+    assert collector._last_user_metrics["end_of_turn_delay"] == 0.600
+    assert collector._last_user_metrics["speech_start_time"] == 95.0
+
+
+def test_session_metrics_collector_grace_continuation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies grace continuation latency anchor correction:
+    user_msg_1 stopped 100.0, user_msg_2 stopped 103.0, assistant started 104.2,
+    SDK e2e 4.2 -> e2e 1.2, source 'measured', sdk_e2e 4.2.
+    """
+    import logging
+
+    collector = SessionMetricsCollector(
+        room_name="test-room-grace",
+        models=_create_test_models(),
+        log_dir=tmp_path,
+    )
+
+    user_msg_1 = llm.ChatMessage(role="user", content=["Алло, я тут"])
+    user_msg_1.metrics = {
+        "stopped_speaking_at": 100.0,
+        "end_of_turn_delay": 0.500,
+        "transcription_delay": 0.300,
+    }
+    collector.process_chat_message(user_msg_1)
+
+    user_msg_2 = llm.ChatMessage(role="user", content=["Продовжую говорити"])
+    user_msg_2.metrics = {
+        "stopped_speaking_at": 103.0,
+    }
+    collector.process_chat_message(user_msg_2)
+
+    asst_msg = llm.ChatMessage(role="assistant", content=["Слухаю вас."])
+    asst_msg.metrics = {
+        "started_speaking_at": 104.2,
+        "e2e_latency": 4.2,
+        "llm_node_ttft": 0.400,
+        "tts_node_ttfb": 0.200,
+    }
+
+    with caplog.at_level(logging.INFO, logger="agent.metrics"):
+        metrics = collector.process_chat_message(asst_msg)
+
+    assert metrics is not None
+    assert metrics["e2e"] == 1.2
+    assert metrics["e2e_source"] == "measured"
+    assert metrics["sdk_e2e"] == 4.2
+    assert metrics["scripted"] is False
+    assert metrics["llm_fallback"] is False
+
+    # Check INFO log message
+    assert "e2e anchor corrected: sdk=4.200 measured=1.200 (turn 1)" in caplog.text
+
+
+def test_session_metrics_collector_fallback_to_sdk_when_stopped_speaking_missing(
+    tmp_path: Path,
+) -> None:
+    """Verifies fallback to SDK e2e_latency when user stopped_speaking_at is missing."""
+    collector = SessionMetricsCollector(
+        room_name="test-room-sdk-fallback",
+        models=_create_test_models(),
+        log_dir=tmp_path,
+    )
+
+    user_msg = llm.ChatMessage(role="user", content=["Привіт"])
+    user_msg.metrics = {
+        "end_of_turn_delay": 0.500,
+        "transcription_delay": 0.300,
+    }
+    collector.process_chat_message(user_msg)
+
+    asst_msg = llm.ChatMessage(role="assistant", content=["Вітаю!"])
+    asst_msg.metrics = {
+        "started_speaking_at": 104.2,
+        "e2e_latency": 1.5,
+        "llm_node_ttft": 0.400,
+        "tts_node_ttfb": 0.200,
+    }
+    metrics = collector.process_chat_message(asst_msg)
+
+    assert metrics is not None
+    assert metrics["e2e"] == 1.5
+    assert metrics["e2e_source"] == "sdk"
+    assert metrics["sdk_e2e"] == 1.5
+
+
+def test_split_user_turn_missing_anchor_computed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verifies that split user turn whose last segment has no stop time ignores
+    stale anchor and SDK value, falling back to computed latency with INFO log:
+    user1 stopped 100.0 (eou 1.0, transcription 0.5), user2 without stop time,
+    assistant started 104.5, llm_ttft 0.66, tts_ttfb 0.13, no SDK e2e -> e2e 1.79.
+    """
+    import logging
+
+    collector = SessionMetricsCollector(
+        room_name="test-room-split-no-stop",
+        models=_create_test_models(),
+        log_dir=tmp_path,
+    )
+
+    user_msg_1 = llm.ChatMessage(role="user", content=["Перший сегмент"])
+    user_msg_1.metrics = {
+        "stopped_speaking_at": 100.0,
+        "end_of_turn_delay": 1.0,
+        "transcription_delay": 0.5,
+    }
+    collector.process_chat_message(user_msg_1)
+
+    user_msg_2 = llm.ChatMessage(role="user", content=["Другий сегмент без стопу"])
+    user_msg_2.metrics = {
+        "speech_start_time": 101.0,
+    }
+    collector.process_chat_message(user_msg_2)
+
+    asst_msg = llm.ChatMessage(role="assistant", content=["Відповідь асистента"])
+    asst_msg.metrics = {
+        "started_speaking_at": 104.5,
+        "llm_node_ttft": 0.66,
+        "tts_node_ttfb": 0.13,
+        "e2e_latency": 4.5,
+    }
+
+    with caplog.at_level(logging.INFO, logger="agent.metrics"):
+        metrics = collector.process_chat_message(asst_msg)
+
+    assert metrics is not None
+    assert metrics["e2e"] == 1.79
+    assert metrics["e2e_source"] == "computed"
+    assert metrics["sdk_e2e"] == 4.5
+    assert metrics["scripted"] is False
+    assert (
+        "e2e anchor unavailable: last user segment has no stop time "
+        "(turn 1), using computed" in caplog.text
+    )
+
+    # Also verify scripted turn with missing anchor produces e2e null
+    user_msg_3 = llm.ChatMessage(role="user", content=["Сегмент зі стопом"])
+    user_msg_3.metrics = {"stopped_speaking_at": 200.0}
+    collector.process_chat_message(user_msg_3)
+
+    user_msg_4 = llm.ChatMessage(role="user", content=["Сегмент без стопу"])
+    user_msg_4.metrics = {}
+    collector.process_chat_message(user_msg_4)
+
+    scripted_msg = llm.ChatMessage(role="assistant", content=["Скриптове прощання"])
+    scripted_msg.metrics = {
+        "started_speaking_at": 205.0,
+        "tts_node_ttfb": 0.12,
+    }
+    m_scripted = collector.process_chat_message(scripted_msg)
+    assert m_scripted is not None
+    assert m_scripted["scripted"] is True
+    assert m_scripted["e2e"] is None
+    assert m_scripted["e2e_source"] == "scripted"
+
+
+def test_compute_call_latency_summary_scripted_excluded() -> None:
+    """Verifies that compute_call_latency_summary excludes scripted turns from p50/max,
+    counts llm and scripted turns, and collects fallback turns.
+    """
+    turns = [
+        {"role": "agent", "turn_index": 1, "metrics": {"scripted": True, "e2e": None}},
+        {"role": "user", "turn_index": 2, "metrics": None},
+        {
+            "role": "agent",
+            "turn_index": 3,
+            "metrics": {"scripted": False, "e2e": 1.2, "llm_fallback": False},
+        },
+        {"role": "user", "turn_index": 4, "metrics": None},
+        {
+            "role": "agent",
+            "turn_index": 5,
+            "metrics": {"scripted": False, "e2e": 1.8, "llm_fallback": True},
+        },
+        {"role": "agent", "turn_index": 6, "metrics": {"scripted": True, "e2e": 0.2}},
+    ]
+    summary = compute_call_latency_summary(turns)
+    assert summary["p50"] == 1.5
+    assert summary["max"] == 1.8
+    assert summary["llm_turns"] == 2
+    assert summary["scripted_turns"] == 2
+    assert summary["fallback_turns"] == [5]
+
+
+def test_compute_call_latency_summary_old_calls_without_metrics() -> None:
+    """Verifies that calls without metrics return clean null/zero values."""
+    turns = [
+        {"role": "agent", "turn_index": 1, "metrics": None},
+        {"role": "user", "turn_index": 2, "metrics": None},
+        {"role": "agent", "turn_index": 3, "metrics": None},
+    ]
+    summary = compute_call_latency_summary(turns)
+    assert summary == {
+        "p50": None,
+        "max": None,
+        "llm_turns": 0,
+        "scripted_turns": 0,
+        "fallback_turns": [],
+    }
+
+
+def test_assistant_turn_with_and_without_llm_ttft(tmp_path: Path) -> None:
+    """Verifies that assistant messages with llm_node_ttft are treated as LLM turns
+    (even with no prior user metrics: scripted=False, e2e=None, e2e_source='missing'),
+    and only messages without llm_node_ttft are scripted.
+    """
+    collector = SessionMetricsCollector(
+        room_name="test-room-llm-without-user",
+        models=_create_test_models(),
+        log_dir=tmp_path,
+    )
+
+    # 1. Assistant message with no prior user metrics but WITH llm_node_ttft -> LLM turn
+    llm_greeting = llm.ChatMessage(role="assistant", content=["Доброго дня!"])
+    llm_greeting.metrics = {
+        "llm_node_ttft": 0.350,
+        "tts_node_ttfb": 0.220,
+        "e2e_latency": 1.200,
+        "llm_metadata": {"model_name": "gemini-3.5-flash-lite"},
+    }
+    m1 = collector.process_chat_message(llm_greeting)
+    assert m1 is not None
+    assert m1["scripted"] is False
+    assert m1["e2e"] is None
+    assert m1["e2e_source"] == "missing"
+    assert m1["sdk_e2e"] == 1.2
+    assert m1["llm_ttft"] == 0.350
+    assert m1["tts_ttfb"] == 0.220
+    assert m1["llm_model"] == "gemini-3.5-flash-lite"
+    assert m1["llm_fallback"] is False
+
+    # 2. Assistant message with no prior user metrics and no llm_node_ttft -> scripted
+    collector2 = SessionMetricsCollector(
+        room_name="test-room-scripted-no-user",
+        models=_create_test_models(),
+        log_dir=tmp_path,
+    )
+    scripted_greeting = llm.ChatMessage(
+        role="assistant", content=["Вітаємо у компанії!"]
+    )
+    scripted_greeting.metrics = {
+        "tts_node_ttfb": 0.180,
+    }
+    m2 = collector2.process_chat_message(scripted_greeting)
+    assert m2 is not None
+    assert m2["scripted"] is True
+    assert m2["e2e"] is None
+    assert m2["e2e_source"] == "scripted"
+    assert m2["llm_ttft"] is None
+    assert m2["llm_model"] is None
+
+    # 3. Assistant message with prior user metrics and no llm_node_ttft -> scripted
+    user_msg = llm.ChatMessage(role="user", content=["Дякую, до побачення"])
+    user_msg.metrics = {"stopped_speaking_at": 50.0}
+    collector2.process_chat_message(user_msg)
+
+    scripted_bye = llm.ChatMessage(role="assistant", content=["Гарного дня!"])
+    scripted_bye.metrics = {
+        "started_speaking_at": 50.8,
+        "tts_node_ttfb": 0.150,
+    }
+    m3 = collector2.process_chat_message(scripted_bye)
+    assert m3 is not None
+    assert m3["scripted"] is True
+    assert m3["e2e"] == 0.8
+    assert m3["e2e_source"] == "scripted"
+    assert m3["llm_ttft"] is None

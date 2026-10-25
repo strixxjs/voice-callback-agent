@@ -9,6 +9,7 @@ live broadcaster (M4 PR 3, SSE) can hook in here without touching callers.
 from __future__ import annotations
 
 import logging
+import statistics
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -31,6 +32,63 @@ CALL_STATUS_FAILED = "failed"
 def room_name_for_call(call_id: uuid.UUID) -> str:
     """Derives the LiveKit room name from the call id."""
     return f"call-{call_id}"
+
+
+def compute_call_latency_summary(turns: list[Any]) -> dict[str, Any]:
+    """Pure helper function computing latency statistics from call turns.
+
+    Calculates:
+      - p50 and max over non-scripted agent turns with non-null e2e (in seconds).
+      - count of LLM turns and scripted turns.
+      - list of turn indexes where llm_fallback is true.
+    """
+    valid_e2es: list[float] = []
+    llm_turns = 0
+    scripted_turns = 0
+    fallback_turns: list[int] = []
+
+    for t in turns:
+        role = getattr(t, "role", None) if not isinstance(t, dict) else t.get("role")
+        if str(role).lower() not in ("agent", "assistant"):
+            continue
+
+        metrics = (
+            getattr(t, "metrics", None) if not isinstance(t, dict) else t.get("metrics")
+        )
+        turn_idx = (
+            getattr(t, "turn_index", None)
+            if not isinstance(t, dict)
+            else t.get("turn_index")
+        )
+
+        if not isinstance(metrics, dict):
+            continue
+
+        is_scripted = bool(metrics.get("scripted", False))
+        if is_scripted:
+            scripted_turns += 1
+        else:
+            llm_turns += 1
+            e2e = metrics.get("e2e")
+            if e2e is not None and isinstance(e2e, (int, float)):
+                valid_e2es.append(float(e2e))
+
+        if metrics.get("llm_fallback") is True and turn_idx is not None:
+            fallback_turns.append(int(turn_idx))
+
+    p50: float | None = None
+    max_val: float | None = None
+    if valid_e2es:
+        p50 = round(float(statistics.median(valid_e2es)), 3)
+        max_val = round(float(max(valid_e2es)), 3)
+
+    return {
+        "p50": p50,
+        "max": max_val,
+        "llm_turns": llm_turns,
+        "scripted_turns": scripted_turns,
+        "fallback_turns": fallback_turns,
+    }
 
 
 def _publish(kind: str, call: Call, data: dict[str, Any]) -> None:
@@ -125,6 +183,7 @@ async def update_call_status(
     ended_at: datetime | None = None,
     duration_seconds: int | None = None,
     latency_summary: dict[str, Any] | None = None,
+    call_config: dict[str, Any] | None = None,
 ) -> Call:
     """Changes call status (and optional lifecycle fields) and commits it."""
     previous = call.status
@@ -137,6 +196,8 @@ async def update_call_status(
         call.duration_seconds = duration_seconds
     if latency_summary is not None:
         call.latency_summary = latency_summary
+    if call_config is not None:
+        call.call_config = call_config
     await db.commit()
     logger.info(
         "Call status lead_id=%s call_id=%s %s -> %s",
@@ -149,6 +210,17 @@ async def update_call_status(
     return call
 
 
+async def set_call_config(
+    db: AsyncSession,
+    call: Call,
+    call_config: dict[str, Any],
+) -> Call:
+    """Sets call configuration directly and commits without emitting status events."""
+    call.call_config = call_config
+    await db.commit()
+    return call
+
+
 async def record_call_turn(
     db: AsyncSession,
     call: Call,
@@ -157,6 +229,7 @@ async def record_call_turn(
     role: str,
     content: str,
     timestamp: datetime,
+    metrics: dict[str, Any] | None = None,
 ) -> CallTurn | None:
     """Stores a transcript turn; idempotent on (call_id, turn_index).
 
@@ -177,6 +250,7 @@ async def record_call_turn(
         role=role,
         content=content,
         timestamp=timestamp,
+        metrics=metrics,
     )
     db.add(turn)
     await db.commit()

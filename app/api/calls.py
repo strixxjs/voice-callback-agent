@@ -21,10 +21,12 @@ from app.schemas import (
     ComponentOut,
     ComponentStatus,
     ExtractionOut,
+    LatencySummaryOut,
     OverviewResponse,
     StageOut,
     TranscriptTurn,
 )
+from app.services.calls import compute_call_latency_summary
 
 router = APIRouter(prefix="/api", tags=["demo"])
 DbSession = Annotated[AsyncSession, Depends(get_db)]
@@ -180,6 +182,9 @@ async def get_call(call_id: uuid.UUID, db: DbSession) -> CallDetail:
         else None
     )
 
+    latency_summary = compute_call_latency_summary(list(turns))
+    latency_out = LatencySummaryOut(**latency_summary)
+
     return CallDetail(
         **_summary_fields(call, lead, ended_by),
         transcript=[
@@ -188,6 +193,7 @@ async def get_call(call_id: uuid.UUID, db: DbSession) -> CallDetail:
                 role=t.role,
                 text=t.content,
                 timestamp=_as_utc(t.timestamp),
+                metrics=t.metrics,
             )
             for t in turns
         ],
@@ -202,6 +208,8 @@ async def get_call(call_id: uuid.UUID, db: DbSession) -> CallDetail:
             for e in events
         ],
         extraction=extraction,
+        call_config=call.call_config,
+        latency=latency_out,
     )
 
 

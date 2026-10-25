@@ -183,6 +183,7 @@ async def test_call_detail_transcript_events_extraction(
         "role": "agent",
         "text": "turn 1",
         "timestamp": data["transcript"][0]["timestamp"],
+        "metrics": None,
     }
     assert [e["event_type"] for e in data["events"]] == ["a", "b", "late"]
     assert data["extraction"] is None
@@ -290,3 +291,133 @@ async def test_overview_llm_follows_provider(
         for c in (await async_client.get("/api/overview")).json()["components"]
     }
     assert components["llm"]["status"] == "configured"
+
+
+async def test_get_call_detail_with_latency_summary_and_config(
+    async_client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """Verifies server-side latency summary and call_config on GET /api/calls/{id}."""
+    config_data = {
+        "llm_provider": "google",
+        "llm_model": "gemini-3.5-flash-lite",
+        "tts_voice_id": "test-voice",
+    }
+    call = await _seed_call(db_session, created_at=T0)
+    call.call_config = config_data
+    db_session.add(call)
+
+    # Turn 1: Scripted greeting
+    db_session.add(
+        CallTurn(
+            call_id=call.id,
+            turn_index=1,
+            role="agent",
+            content="Привіт!",
+            timestamp=T0 + timedelta(seconds=1),
+            metrics={"e2e": None, "scripted": True, "e2e_source": "scripted"},
+        )
+    )
+    # Turn 2: User utterance
+    db_session.add(
+        CallTurn(
+            call_id=call.id,
+            turn_index=2,
+            role="user",
+            content="Добрий день",
+            timestamp=T0 + timedelta(seconds=3),
+            metrics=None,
+        )
+    )
+    # Turn 3: LLM turn (primary)
+    db_session.add(
+        CallTurn(
+            call_id=call.id,
+            turn_index=3,
+            role="agent",
+            content="Як справи?",
+            timestamp=T0 + timedelta(seconds=5),
+            metrics={
+                "e2e": 1.2,
+                "scripted": False,
+                "e2e_source": "measured",
+                "llm_fallback": False,
+            },
+        )
+    )
+    # Turn 4: User utterance
+    db_session.add(
+        CallTurn(
+            call_id=call.id,
+            turn_index=4,
+            role="user",
+            content="Добре, шукаю CRM",
+            timestamp=T0 + timedelta(seconds=8),
+            metrics=None,
+        )
+    )
+    # Turn 5: LLM turn (fallback)
+    db_session.add(
+        CallTurn(
+            call_id=call.id,
+            turn_index=5,
+            role="agent",
+            content="Зрозуміло.",
+            timestamp=T0 + timedelta(seconds=10),
+            metrics={
+                "e2e": 1.8,
+                "scripted": False,
+                "e2e_source": "sdk",
+                "llm_fallback": True,
+            },
+        )
+    )
+    await db_session.commit()
+
+    resp = await async_client.get(f"/api/calls/{call.id}")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["call_config"] == config_data
+    assert data["latency"] == {
+        "p50": 1.5,
+        "max": 1.8,
+        "llm_turns": 2,
+        "scripted_turns": 1,
+        "fallback_turns": [5],
+    }
+    assert data["transcript"][0]["metrics"]["scripted"] is True
+    assert data["transcript"][2]["metrics"]["e2e"] == 1.2
+
+
+async def test_get_old_call_detail_without_metrics(
+    async_client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """Verifies that old calls with null call_config and null metrics
+    return null/clean latency without 500 error.
+    """
+    call = await _seed_call(db_session, created_at=T0)
+    db_session.add(
+        CallTurn(
+            call_id=call.id,
+            turn_index=1,
+            role="agent",
+            content="Старий дзвінок",
+            timestamp=T0,
+            metrics=None,
+        )
+    )
+    await db_session.commit()
+
+    resp = await async_client.get(f"/api/calls/{call.id}")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["call_config"] is None
+    assert data["latency"] == {
+        "p50": None,
+        "max": None,
+        "llm_turns": 0,
+        "scripted_turns": 0,
+        "fallback_turns": [],
+    }
+    assert data["transcript"][0]["metrics"] is None
